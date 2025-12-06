@@ -225,7 +225,7 @@ class AmadeusModelAutoregressiveWrapper(nn.Module):
     return total_out, sampled_token
 
   @torch.inference_mode()
-  def generate(self, manual_seed, max_seq_len, condition=None, num_target_measures=4, sampling_method=None, threshold=None, temperature=1, batch_size=1, context=None):
+  def generate(self, manual_seed, max_seq_len, condition=None, num_target_measures=4, sampling_method=None, threshold=None, temperature=1, batch_size=1, context=None, input_note=None):
     '''
     Autoregressively generates a sequence of tokens by repeatedly sampling the next token 
     until the desired maximum sequence length is reached or the end token is encountered.
@@ -242,6 +242,24 @@ class AmadeusModelAutoregressiveWrapper(nn.Module):
     Returns:
     - total_out: The generated sequence of tokens as a tensor.
     '''
+    # === NEW: Process input_note if provided ===
+    if input_note is not None:
+      # input_note shape: [batch_size, num_notes, 8] or [num_notes, 8]
+      if len(input_note.shape) == 2:
+        input_note = input_note.unsqueeze(0)  # [1, num_notes, 8]
+      
+      # Add positional encoding
+      note_embedding = self.net.input_embedder(input_note) + self.net.pos_enc(input_note)
+      note_embedding = self.net.emb_dropout(note_embedding)
+      
+      # === Concatenate with text context ===
+      if context is not None:
+        # context: [batch_size, text_seq_len, dim]
+        # note_embedding: [batch_size, num_notes, dim]
+        context = torch.cat([note_embedding, context], dim=1)  # [batch_size, text_seq_len + num_notes, dim]
+      else:
+        context = note_embedding
+    
     # Prepare the starting sequence for inference
     total_out = self._prepare_inference(self.net.start_token, manual_seed, condition, num_target_measures)
 
@@ -310,7 +328,7 @@ class AmadeusModelAutoregressiveWrapper(nn.Module):
 
     return total_out
   
-  def generate_batch(self, manual_seed, max_seq_len, condition=None, num_target_measures=4, sampling_method=None, threshold=None, temperature=1, batch_size=1):
+  def generate_batch(self, manual_seed, max_seq_len, condition=None, num_target_measures=4, sampling_method=None, threshold=None, temperature=1, batch_size=1, input_note=None):
     '''
     Autoregressively generates a sequence of tokens by repeatedly sampling the next token 
     until the desired maximum sequence length is reached or the end token is encountered.
@@ -327,6 +345,23 @@ class AmadeusModelAutoregressiveWrapper(nn.Module):
     Returns:
     - total_out: The generated sequence of tokens as a tensor.
     '''
+    # === NEW: Process input_note if provided ===
+    if input_note is not None:
+      if len(input_note.shape) == 2:
+        input_note = input_note.unsqueeze(0)  # [1, num_notes, 8]
+      
+      #input_note = input_note.to(self.net.device)
+      note_embedding = self.net.input_embedder(input_note) + self.net.pos_enc(input_note)
+      note_embedding = self.net.emb_dropout(note_embedding)
+      
+      # Repeat for batch
+      note_embedding = note_embedding.repeat(batch_size, 1, 1)
+      
+      if context is not None:
+        context = torch.cat([note_embedding, context], dim=1)
+      else:
+        context = note_embedding
+    
     # Prepare the starting sequence for inference
     total_out = self._prepare_inference(self.net.start_token, manual_seed, condition, num_target_measures)
     # total_out (1,1,num) -> (bs,1,num)
@@ -416,11 +451,11 @@ class AmadeusModel(nn.Module):
     return self.decoder(input_seq, target, context=context)
   
   @torch.inference_mode()
-  def generate(self, manual_seed, max_seq_len, condition=None, num_target_measures=4, sampling_method=None, threshold=None, temperature=1,batch_size=1,context=None):
+  def generate(self, manual_seed, max_seq_len, condition=None, num_target_measures=4, sampling_method=None, threshold=None, temperature=1,batch_size=1,context=None, input_note=None):
     if batch_size == 1:
-      return self.decoder.generate(manual_seed, max_seq_len, condition, num_target_measures, sampling_method, threshold, temperature, context=context)
+      return self.decoder.generate(manual_seed, max_seq_len, condition, num_target_measures, sampling_method, threshold, temperature, context=context, input_note=input_note)
     else:
-      return self.decoder.generate_batch(manual_seed, max_seq_len, condition, num_target_measures, sampling_method, threshold, temperature, batch_size, context=context)
+      return self.decoder.generate_batch(manual_seed, max_seq_len, condition, num_target_measures, sampling_method, threshold, temperature, batch_size, context=context, input_note=input_note)
 
 class AmadeusModel4Encodec(AmadeusModel):
   def __init__(

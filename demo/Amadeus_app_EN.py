@@ -92,6 +92,7 @@ def load_resources(wandb_exp_dir, device):
 
 
 import time
+import numpy as np
 
 def generate_with_text_prompt(config, vocab, model, device, prompt, text_encoder_model,
                               sampling_method='top_p', threshold=0.99,
@@ -102,7 +103,12 @@ def generate_with_text_prompt(config, vocab, model, device, prompt, text_encoder
     context = tokenizer(prompt, return_tensors='pt',
                         padding='max_length', truncation=True, max_length=128).to(device)
     context = encoder(**context).last_hidden_state
-
+    
+    file_path = "dataset/represented_data/tuneidx/tuneidx_test/nb8/sample.npz"  # 読みたい npz ファイルのパス
+    data = np.load(file_path)
+    input_note = data['arr_0']
+    input_note = torch.tensor(input_note, dtype=torch.long).to(device)
+    
     in_beat_resolution_dict = {'Pop1k7': 4, 'Pop909': 4, 'SOD': 12, 'LakhClean': 4}
     in_beat_resolution = in_beat_resolution_dict.get(config.dataset, 4)
 
@@ -117,7 +123,7 @@ def generate_with_text_prompt(config, vocab, model, device, prompt, text_encoder
     generated_sample = model.generate(
         0, generation_length, condition=None, num_target_measures=None,
         sampling_method=sampling_method, threshold=threshold,
-        temperature=temperature, context=context
+        temperature=temperature, context=context, input_note=input_note
     )
     if encoding_scheme == 'nb':
         generated_sample = reverse_shift_and_pad_for_tensor(generated_sample, config.data_params.first_pred_feature)
