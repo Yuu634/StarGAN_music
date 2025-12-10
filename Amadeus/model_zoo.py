@@ -241,31 +241,20 @@ class AmadeusModelAutoregressiveWrapper(nn.Module):
 
     Returns:
     - total_out: The generated sequence of tokens as a tensor.
-    '''
-    # === NEW: Process input_note if provided ===
-    if input_note is not None:
-      # input_note shape: [batch_size, num_notes, 8] or [num_notes, 8]
-      if len(input_note.shape) == 2:
-        input_note = input_note.unsqueeze(0)  # [1, num_notes, 8]
-      
-      # Add positional encoding
-      note_embedding = self.net.input_embedder(input_note) + self.net.pos_enc(input_note)
-      note_embedding = self.net.emb_dropout(note_embedding)
-      
-      # === Concatenate with text context ===
-      if context is not None:
-        # context: [batch_size, text_seq_len, dim]
-        # note_embedding: [batch_size, num_notes, dim]
-        context = torch.cat([note_embedding, context], dim=1)  # [batch_size, text_seq_len + num_notes, dim]
-      else:
-        context = note_embedding
-    
+    '''  
     # Prepare the starting sequence for inference
     total_out = self._prepare_inference(self.net.start_token, manual_seed, condition, num_target_measures)
 
+    # === NEW: Process input_note if provided ===
+    generation_step = 1
+
     # If a condition is provided, run one initial step
     if condition is not None:
-      _, _, cache = self._run_one_step(total_out[:, -self.net.input_length:], cache=LayerIntermediates(), sampling_method=sampling_method, threshold=threshold, temperature=temperature, context=context)
+      if input_note is not None:
+        note_vec = input_note[generation_step].unsqueeze(0).unsqueeze(0)
+        _, _, cache = self._run_one_step(torch.cat([total_out[:, -self.net.input_length:], note_vec], dim=1), cache=LayerIntermediates(), sampling_method=sampling_method, threshold=threshold, temperature=temperature, context=context)
+      else:
+        _, _, cache = self._run_one_step(total_out[:, -self.net.input_length:], cache=LayerIntermediates(), sampling_method=sampling_method, threshold=threshold, temperature=temperature, context=context)
     else:
       cache = LayerIntermediates()
 
@@ -276,7 +265,11 @@ class AmadeusModelAutoregressiveWrapper(nn.Module):
     token_time_list = []
     while total_out.shape[1] < max_seq_len:
       pbar.update(1)
-      input_tensor = total_out[:, -self.net.input_length:]
+      generation_step += 1
+      input_tensor = total_out[:, -self.net.input_length:] 
+      if input_note is not None:
+        note_vec = input_note[generation_step].unsqueeze(0).unsqueeze(0)
+        input_tensor = torch.cat([input_tensor, note_vec], dim=1)
       # Generate the next token and update the cache
       time_start = time.time()
       _, sampled_token, cache, hidden_vec = self._run_one_step(input_tensor, cache=cache, sampling_method=sampling_method, threshold=threshold, temperature=temperature,bos_hidden_vec=bos_hidden_vec, context=context)
@@ -345,30 +338,23 @@ class AmadeusModelAutoregressiveWrapper(nn.Module):
     Returns:
     - total_out: The generated sequence of tokens as a tensor.
     '''
-    # === NEW: Process input_note if provided ===
-    if input_note is not None:
-      if len(input_note.shape) == 2:
-        input_note = input_note.unsqueeze(0)  # [1, num_notes, 8]
-      
-      #input_note = input_note.to(self.net.device)
-      note_embedding = self.net.input_embedder(input_note) + self.net.pos_enc(input_note)
-      note_embedding = self.net.emb_dropout(note_embedding)
-      
-      # Repeat for batch
-      note_embedding = note_embedding.repeat(batch_size, 1, 1)
-      
-      if context is not None:
-        context = torch.cat([note_embedding, context], dim=1)
-      else:
-        context = note_embedding
     
     # Prepare the starting sequence for inference
     total_out = self._prepare_inference(self.net.start_token, manual_seed, condition, num_target_measures)
     # total_out (1,1,num) -> (bs,1,num)
     total_out = total_out.repeat(batch_size, 1, 1)
+    
+    # === NEW: Process input_note if provided ===
+    generation_step = 1
+      
     # If a condition is provided, run one initial step
     if condition is not None:
-      _, _, cache = self._run_one_step(total_out[:, -self.net.input_length:], cache=LayerIntermediates(), sampling_method=sampling_method, threshold=threshold, temperature=temperature)
+      if input_note is not None:
+        note_vec = input_note[generation_step].unsqueeze(0).unsqueeze(0)
+        note_vec = note_vec.repeat(batch_size, 1, 1)
+        _, _, cache = self._run_one_step(torch.cat([total_out[:, -self.net.input_length:], note_vec], dim=1), cache=LayerIntermediates(), sampling_method=sampling_method, threshold=threshold, temperature=temperature)
+      else:
+        _, _, cache = self._run_one_step(total_out[:, -self.net.input_length:], cache=LayerIntermediates(), sampling_method=sampling_method, threshold=threshold, temperature=temperature)
     else:
       cache = LayerIntermediates()
 
@@ -376,8 +362,18 @@ class AmadeusModelAutoregressiveWrapper(nn.Module):
     pbar = tqdm(total=max_seq_len, desc="Generating tokens", unit="token")
     while total_out.shape[1] < max_seq_len:
       pbar.update(1)
+      generation_step += 1
       input_tensor = total_out[:, -self.net.input_length:]
 
+      # === NEW: input_noteのi番目の行を結合 ===
+      if input_note is not None and generation_step < input_note.shape[0]:
+        # i番目の音符を取得: [num_features]
+        note_vec = input_note[generation_step]  # [num_features]
+        # バッチ対応: [num_features] -> [batch_size, 1, num_features]
+        note_vec = note_vec.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1)
+        # input_tensorに結合: [batch_size, input_length, num_features] + [batch_size, 1, num_features]
+        input_tensor = torch.cat([input_tensor, note_vec], dim=1)
+        
       # Generate the next token and update the cache
       _, sampled_token, cache = self._run_one_step(input_tensor, cache=cache, sampling_method=sampling_method, threshold=threshold, temperature=temperature)
 
