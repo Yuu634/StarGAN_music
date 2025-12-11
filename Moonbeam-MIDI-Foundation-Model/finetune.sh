@@ -1,0 +1,23 @@
+accelerate launch --num_processes 3 recipes/finetuning/real_finetuning_player_classification.py \
+  --lr 2e-4 \
+  --val_batch_size 22 \
+  --run_validation True \
+  --validation_interval 399 \
+  --save_metrics True \
+  --dist_checkpoint_root_folder "models/emotion_classification-v1/checkpoints" \
+  --dist_checkpoint_folder ddp \
+  --trained_checkpoint_path "models/pretrained/moonbeam_839M.pt" \
+  --pure_bf16 True \
+  --enable_ddp False \
+  --use_peft True \
+  --peft_method lora \
+  --quantization False \
+  --model_name "Emotion-classify" \
+  --dataset "player_classification_dataset" \
+  --output_dir "models/emotion_classification-v1" \
+  --batch_size_training 4 \
+  --context_length 133 \
+  --num_epochs 100 \
+  --use_wandb True \
+  --use_cache False \
+  --individual_eval True
