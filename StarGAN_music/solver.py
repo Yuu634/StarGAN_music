@@ -8,8 +8,11 @@ import numpy as np
 import os
 import time
 import datetime
-from Amadeus.Amadeus import model_zoo
 import re
+from Amadeus.Amadeus import model_zoo
+import sys
+sys.path.append("Moonbeam-MIDI-Foundation-Model")
+from inference import MusicEmotionClassifier
 
 class Solver(object):
     """Solver for training and testing StarGAN."""
@@ -89,7 +92,13 @@ class Solver(object):
                 depth=nn_params.main_decoder.num_layer,
                 dropout=nn_params.model_dropout,
             )
-            self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim, self.d_repeat_num) 
+            """self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim, self.d_repeat_num)"""
+            self.D = MusicEmotionClassifier(
+                pretrained_checkpoint="models/pretrained/moonbeam_839M.pt",
+                lora_adapter_path="models/emotion_classification-v1",
+                config_path="src/llama_recipes/configs/player_classification_config.json",
+                device="cuda" if torch.cuda.is_available() else "cpu"
+            )
         elif self.dataset in ['Both']:
             """self.G = Generator(self.g_conv_dim, self.c_dim+self.c2_dim+2, self.g_repeat_num)   # 2 for mask vector."""
             self.G = getattr(model_zoo, "AmadeusModel")(
@@ -107,7 +116,13 @@ class Solver(object):
                 depth=nn_params.main_decoder.num_layer,
                 dropout=nn_params.model_dropout,
             )
-            self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim+self.c2_dim, self.d_repeat_num)
+            """self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim+self.c2_dim, self.d_repeat_num)"""
+            self.D = MusicEmotionClassifier(
+                pretrained_checkpoint="models/pretrained/moonbeam_839M.pt",
+                lora_adapter_path="models/emotion_classification-v1",
+                config_path="src/llama_recipes/configs/player_classification_config.json",
+                device="cuda" if torch.cuda.is_available() else "cpu"
+            )
 
         self.g_optimizer = torch.optim.Adam(self.G.parameters(), self.g_lr, [self.beta1, self.beta2])
         self.d_optimizer = torch.optim.Adam(self.D.parameters(), self.d_lr, [self.beta1, self.beta2])
@@ -446,19 +461,34 @@ class Solver(object):
             # =================================================================================== #
 
             # Compute loss with real images.
-            out_src, out_cls = self.D(x_real)
+            """out_src, out_cls = self.D(x_real)"""
+            result = self.D.predict(str(npy_path), return_probabilities=False)
+            out_src, out_cls = result['predicted_class']
+            
             d_loss_real = - torch.mean(out_src)
             d_loss_cls = self.classification_loss(out_cls, label_org, self.dataset)
 
             # Compute loss with fake images.
-            x_fake = self.G(x_real, c_trg)
-            out_src, out_cls = self.D(x_fake.detach())
+            """x_fake = self.G(x_real, c_trg)"""
+            x_fake = self.G.generate(
+                    0, generation_length, condition=None, num_target_measures=None,
+                    sampling_method=sampling_method, threshold=threshold,
+                    temperature=temperature, context=context, input_note=input_note
+                )
+            
+            """out_src, out_cls = self.D(x_fake.detach())"""
+            result = self.D.predict(str(npy_path), return_probabilities=False)
+            out_src, out_cls = result['predicted_class']
+            
             d_loss_fake = torch.mean(out_src)
 
             # Compute loss for gradient penalty.
             alpha = torch.rand(x_real.size(0), 1, 1, 1).to(self.device)
             x_hat = (alpha * x_real.data + (1 - alpha) * x_fake.data).requires_grad_(True)
-            out_src, _ = self.D(x_hat)
+            """out_src, _ = self.D(x_hat)"""
+            result = self.D.predict(str(npy_path), return_probabilities=False)
+            out_src, _ = result['predicted_class']
+            
             d_loss_gp = self.gradient_penalty(out_src, x_hat)
 
             # Backward and optimize.
@@ -490,7 +520,10 @@ class Solver(object):
                 # ＜Amadeus表現⇒Moonbeam表現へ変換＞
                 x_fake_D = self.amadeus_to_moonbeam(x_fake)
                 
-                out_src, out_cls = self.D(x_fake)
+                """out_src, out_cls = self.D(x_fake)"""
+                result = self.D.predict(str(npy_path), return_probabilities=False)
+                out_src, out_cls = result['predicted_class']
+                
                 g_loss_fake = - torch.mean(out_src)
                 g_loss_cls = self.classification_loss(out_cls, label_trg, self.dataset)
 
