@@ -8,7 +8,8 @@ import numpy as np
 import os
 import time
 import datetime
-
+from Amadeus.Amadeus import model_zoo
+import re
 
 class Solver(object):
     """Solver for training and testing StarGAN."""
@@ -72,10 +73,40 @@ class Solver(object):
     def build_model(self):
         """Create a generator and a discriminator."""
         if self.dataset in ['CelebA', 'RaFD']:
-            self.G = Generator(self.g_conv_dim, self.c_dim, self.g_repeat_num)
+            """self.G = Generator(self.g_conv_dim, self.c_dim, self.g_repeat_num)"""
+            self.G = getattr(model_zoo, "AmadeusModel")(
+                vocab=vocab,
+                input_length=config.train_params.input_length,
+                prediction_order=prediction_order,
+                input_embedder_name=nn_params.input_embedder_name,
+                main_decoder_name=nn_params.main_decoder_name,
+                sub_decoder_name=nn_params.sub_decoder_name,
+                sub_decoder_depth=nn_params.sub_decoder.num_layer if hasattr(nn_params, 'sub_decoder') else 0,
+                sub_decoder_enricher_use=nn_params.sub_decoder.feature_enricher_use \
+                    if hasattr(nn_params, 'sub_decoder') and hasattr(nn_params.sub_decoder, 'feature_enricher_use') else False,
+                dim=nn_params.main_decoder.dim_model,
+                heads=nn_params.main_decoder.num_head,
+                depth=nn_params.main_decoder.num_layer,
+                dropout=nn_params.model_dropout,
+            )
             self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim, self.d_repeat_num) 
         elif self.dataset in ['Both']:
-            self.G = Generator(self.g_conv_dim, self.c_dim+self.c2_dim+2, self.g_repeat_num)   # 2 for mask vector.
+            """self.G = Generator(self.g_conv_dim, self.c_dim+self.c2_dim+2, self.g_repeat_num)   # 2 for mask vector."""
+            self.G = getattr(model_zoo, "AmadeusModel")(
+                vocab=vocab,
+                input_length=config.train_params.input_length,
+                prediction_order=prediction_order,
+                input_embedder_name=nn_params.input_embedder_name,
+                main_decoder_name=nn_params.main_decoder_name,
+                sub_decoder_name=nn_params.sub_decoder_name,
+                sub_decoder_depth=nn_params.sub_decoder.num_layer if hasattr(nn_params, 'sub_decoder') else 0,
+                sub_decoder_enricher_use=nn_params.sub_decoder.feature_enricher_use \
+                    if hasattr(nn_params, 'sub_decoder') and hasattr(nn_params.sub_decoder, 'feature_enricher_use') else False,
+                dim=nn_params.main_decoder.dim_model,
+                heads=nn_params.main_decoder.num_head,
+                depth=nn_params.main_decoder.num_layer,
+                dropout=nn_params.model_dropout,
+            )
             self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim+self.c2_dim, self.d_repeat_num)
 
         self.g_optimizer = torch.optim.Adam(self.G.parameters(), self.g_lr, [self.beta1, self.beta2])
@@ -179,13 +210,187 @@ class Solver(object):
         elif dataset == 'RaFD':
             return F.cross_entropy(logit, target)
 
+    def amadeus_to_moonbeam(amadeus_tokens, time_resolution=10, default_tempo=120, in_beat_resolution=4):
+        # (Beat + 小節数) * Tempo → onset(ms)
+        # duration * Tempo → duration(ms)
+        # pitch → octave*12 + pitch_class
+        
+        # Amadeus表現：(type, beat, chord, tempo, instrument, pitch, duration, velocity)
+        """
+        Type：拍子の変化や継続の組み合わせの違いをそれぞれ表すもの。
+        Beat：同一小節内における音符の相対的な位置。
+        Chord：現在の音符が属している和音。
+        Tempo：音符の再生速度。一般に、テンポが高いほど楽曲は速くなる。
+        Instrument：現在の音符を演奏している楽器。
+        Pitch：音符の高さ。MIDI仕様に基づく128段階の離散値で表される。
+        Duration：音符が演奏される長さ（継続時間）。
+        Velocity：音符がどの強さで演奏されるかを表す値で、音量の大きさを決定する。
+        例）{'type': 'NNN_time_signature_4/4', 'beat': 'Beat_2', 'chord': 'Chord_N_N', 'tempo': 'Tempo_121', 'instrument': 'Instrument_114', 'pitch': 'Note_Pitch_48', 'duration': 'Note_Duration_2', 'velocity': 'Note_Velocity_100'}
+        """
+        # Moonbeam表現：(onset, duration, octave, pitch_class, instrument, velocity) 
+        """
+        onset・durationの最小単位は10ms
+        onset：音の開始位置　4097トークン(M-model), 1024トークン(S-model)
+        duration：音の継続時間　4097トークン(M-model), 1024トークン(S-model)
+        octave：11トークン
+        pitch_class：12トークン(1オクターブの音階分)
+        instrument：129トークン(MIDI楽器全般)
+        velocity：128トークン
+        """
+        
+        # Convert to numpy for easier processing
+        if isinstance(amadeus_tokens, torch.Tensor):
+            amadeus_np = amadeus_tokens.cpu().numpy()
+            use_torch = True
+        elif isinstance(amadeus_tokens, list):
+            amadeus_np = np.array(amadeus_tokens)
+            use_torch = False
+        else:
+            amadeus_np = np.array(amadeus_tokens)
+            use_torch = False
+        
+        # Check shape and transpose if needed
+        if amadeus_np.shape[0] == 8:
+            amadeus_np = amadeus_np.T  # [num_notes, 8]
+        
+        num_notes = amadeus_np.shape[0]
+        moonbeam_np = np.zeros((num_notes, 6), dtype=np.int32)
+        
+        # State tracking
+        current_bar = -1
+        current_tempo = default_tempo
+        current_time_signature = (4, 4)  # (numerator, denominator)
+        
+        for i in range(num_notes):
+            type_token = amadeus_np[i, 0]
+            beat_token = amadeus_np[i, 1]
+            chord_token = amadeus_np[i, 2]
+            tempo_token = amadeus_np[i, 3]
+            instrument_token = amadeus_np[i, 4]
+            pitch_token = amadeus_np[i, 5]
+            duration_token = amadeus_np[i, 6]
+            velocity_token = amadeus_np[i, 7]
+            
+            # Parse type token (NNN/SNN/SSN/SSS format)
+            if isinstance(type_token, str):
+                # Check for time signature change (NNN format)
+                if type_token.startswith('NNN_time_signature_'):
+                    time_sig_match = re.search(r'time_signature_(\d+)/(\d+)', type_token)
+                    if time_sig_match:
+                        current_time_signature = (int(time_sig_match.group(1)), int(time_sig_match.group(2)))
+                    current_bar += 1
+                elif type_token == 'SNN':  # Same time sig, new bar, new beat
+                    current_bar += 1
+                # SSN and SSS don't change bar
+            
+            # Extract tempo
+            if isinstance(tempo_token, str):
+                tempo_match = re.search(r'Tempo_(\d+)', tempo_token)
+                if tempo_match:
+                    current_tempo = int(tempo_match.group(1))
+            else:
+                current_tempo = int(tempo_token) if tempo_token else default_tempo
+            
+            # Extract beat position within bar (0-15 for 4/4 time with in_beat_resolution=4)
+            if isinstance(beat_token, str):
+                beat_match = re.search(r'Beat_(\d+)', beat_token)
+                beat_index = int(beat_match.group(1)) if beat_match else 0
+            else:
+                beat_index = int(beat_token)
+            
+            # Calculate onset
+            # Beat index represents position in bar (0-15 for 4/4, in_beat_resolution=4)
+            numerator, denominator = current_time_signature
+            
+            # Total subdivisions per bar
+            subdivisions_per_bar = numerator * (4 / denominator) * in_beat_resolution
+            # For 4/4: 4 * 1 * 4 = 16 subdivisions per bar
+            
+            # Calculate onset in subdivisions (16th notes for in_beat_resolution=4)
+            onset_in_subdivisions = current_bar * subdivisions_per_bar + beat_index
+            
+            # Convert to quarter notes
+            onset_in_quarter_notes = onset_in_subdivisions / in_beat_resolution
+            
+            # Convert to milliseconds
+            ms_per_quarter_note = 60000.0 / current_tempo
+            onset_ms = onset_in_quarter_notes * ms_per_quarter_note
+            
+            # Convert to 10ms resolution
+            onset_in_10ms = int(round(onset_ms / time_resolution))
+            
+            # Extract duration (in subdivisions)
+            if isinstance(duration_token, str):
+                dur_match = re.search(r'Note_Duration_([\d.]+)', duration_token)
+                duration_in_subdivisions = float(dur_match.group(1)) if dur_match else 1.0
+            else:
+                duration_in_subdivisions = float(duration_token)
+            
+            # Convert duration to quarter notes
+            duration_in_quarter_notes = duration_in_subdivisions / in_beat_resolution
+            
+            # Convert to milliseconds
+            duration_ms = duration_in_quarter_notes * ms_per_quarter_note
+            duration_in_10ms = int(round(duration_ms / time_resolution))
+            duration_in_10ms = max(1, min(duration_in_10ms, 1024))
+            
+            # Extract pitch and convert to octave + pitch_class
+            if isinstance(pitch_token, str):
+                pitch_match = re.search(r'Note_Pitch_(\d+)', pitch_token)
+                pitch = int(pitch_match.group(1)) if pitch_match else 60
+            else:
+                pitch = int(pitch_token)
+            
+            octave = pitch // 12
+            pitch_class = pitch % 12
+            octave = max(0, min(octave, 10))
+            
+            # Extract instrument
+            if isinstance(instrument_token, str):
+                inst_match = re.search(r'Instrument_(\d+)', instrument_token)
+                instrument = int(inst_match.group(1)) if inst_match else 0
+            else:
+                instrument = int(instrument_token)
+            
+            instrument = max(0, min(instrument, 128))
+            
+            # Extract velocity
+            if isinstance(velocity_token, str):
+                vel_match = re.search(r'Note_Velocity_(\d+)', velocity_token)
+                velocity = int(vel_match.group(1)) if vel_match else 64
+            else:
+                velocity = int(velocity_token)
+            
+            velocity = max(0, min(velocity, 127))
+            
+            # Store in Moonbeam format
+            moonbeam_np[i, 0] = onset_in_10ms
+            moonbeam_np[i, 1] = duration_in_10ms
+            moonbeam_np[i, 2] = octave
+            moonbeam_np[i, 3] = pitch_class
+            moonbeam_np[i, 4] = instrument
+            moonbeam_np[i, 5] = velocity
+        
+        # Convert back to torch if input was torch
+        if use_torch:
+            moonbeam_tokens = torch.from_numpy(moonbeam_np).long()
+        else:
+            moonbeam_tokens = moonbeam_np
+        
+        return moonbeam_tokens
+
+    
     def train(self):
         """Train StarGAN within a single dataset."""
         # Set data loader.
+        
+        """
         if self.dataset == 'CelebA':
             data_loader = self.celeba_loader
         elif self.dataset == 'RaFD':
             data_loader = self.rafd_loader
+        """
+        data_loader = midi_loader
 
         # Fetch fixed inputs for debugging.
         data_iter = iter(data_loader)
@@ -275,13 +480,28 @@ class Solver(object):
             
             if (i+1) % self.n_critic == 0:
                 # Original-to-target domain.
-                x_fake = self.G(x_real, c_trg)
+                """x_fake = self.G(x_real, c_trg)"""
+                # 生成譜面の音符属性表現列を取得
+                x_fake = self.G.generate(
+                    0, generation_length, condition=None, num_target_measures=None,
+                    sampling_method=sampling_method, threshold=threshold,
+                    temperature=temperature, context=context, input_note=input_note
+                )
+                # ＜Amadeus表現⇒Moonbeam表現へ変換＞
+                x_fake_D = self.amadeus_to_moonbeam(x_fake)
+                
                 out_src, out_cls = self.D(x_fake)
                 g_loss_fake = - torch.mean(out_src)
                 g_loss_cls = self.classification_loss(out_cls, label_trg, self.dataset)
 
                 # Target-to-original domain.
-                x_reconst = self.G(x_fake, c_org)
+                """x_reconst = self.G(x_fake, c_org)"""
+                x_reconst = self.G.generate(
+                    0, generation_length, condition=None, num_target_measures=None,
+                    sampling_method=sampling_method, threshold=threshold,
+                    temperature=temperature, context=context, input_note=input_note
+                )
+                
                 g_loss_rec = torch.mean(torch.abs(x_real - x_reconst))
 
                 # Backward and optimize.
