@@ -22,9 +22,10 @@ from transformers import (
     LlamaForCausalLM,
     LlamaForSequenceClassification,
     LlamaConfig,
+    LlamaPreTrainedModel,
 )
 from llama_recipes.datasets.music_tokenizer import MusicTokenizer
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaModel
 
 from llama_recipes.configs import fsdp_config as FSDP_CONFIG
 from llama_recipes.configs import ddp_config as DDP_CONFIG
@@ -54,6 +55,142 @@ from llama_recipes.utils.train_utils import (
     get_policies,
 )
 from accelerate.utils import is_xpu_available
+
+"""ソース真偽判定用線形層追加モデル"""
+from torch import nn
+from typing import List, Optional, Tuple, Union
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from transformers.modeling_outputs import SequenceClassifierOutputWithPast
+from transformers.utils import add_start_docstrings_to_model_forward
+from transformers.cache_utils import Cache
+class LlamaForSequenceDoubleClassification(
+    LlamaPreTrainedModel
+):
+    def __init__(self, config):
+        super().__init__(config)
+        self.classification_token = config.classification_token
+        self.num_labels = config.num_labels
+        self.model = LlamaModel(config)
+        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+        # 追加: 真偽分類用線形層
+        self.real_fake_score = nn.Linear(config.hidden_size, 2, bias=False)
+        self.model.classification_token_embedding = torch.nn.Embedding(1, config.hidden_size)
+        self.model.classification_token_embedding.requires_grad = True
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        #outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        position_ids = input_ids
+        transformer_outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids, #if sdpa: position_ids carry information about onset, dur, pitch, instr, vel; elif sdpa_baseline: position_ids are None
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=None,
+        )
+
+        hidden_states = transformer_outputs[0]
+        logits = self.score(hidden_states)
+        # 追加: 真偽分類スコア
+        real_fake_logits = self.real_fake_score(hidden_states)
+
+
+        where_eos = (input_ids[..., 0] == self.classification_token)  # Shape: (batch_size, seq_len)
+        # Use `where_eos` to extract logits
+        batch_indices, seq_indices = where_eos.nonzero(as_tuple=True)  # Get batch and sequence indices # get position-1 before the EOS token
+
+        # Gather logits
+        pooled_logits = logits[batch_indices, seq_indices]  # Shape: (num_eos_positions, hidden_dim) , because it might learn just to turn off the sequence
+        # 追加: 真偽分類用logits抽出
+        pooled_real_fake_logits = real_fake_logits[batch_indices, seq_indices]
+        
+        loss = None
+        if labels is not None:
+            labels = labels[batch_indices, seq_indices].to(logits.device)
+            
+            # 追加: 真偽分類用loss計算
+            loss_fct = CrossEntropyLoss()
+            real_fake_loss = loss_fct(pooled_real_fake_logits.view(-1, 2), labels.view(-1)) #TODO: add weighting param since there might be an arbitrary number of labels here
+            number_of_labels = where_eos.sum()
+            if number_of_labels ==0:
+                real_fake_loss = torch.tensor(0., requires_grad=True).to(pooled_real_fake_logits)
+            else:
+                # loss = loss/number_of_labels
+                real_fake_loss = real_fake_loss
+            
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    self.config.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                    self.config.problem_type = "single_label_classification"
+                else:
+                    self.config.problem_type = "multi_label_classification"
+
+            if self.config.problem_type == "regression":
+                loss_fct = MSELoss()
+                if self.num_labels == 1:
+                    classification_loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
+                else:
+                    classification_loss = loss_fct(pooled_logits, labels)
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = CrossEntropyLoss()
+                classification_loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1)) #TODO: add weighting param since there might be an arbitrary number of labels here
+                number_of_labels = where_eos.sum()
+                if number_of_labels ==0:
+                    classification_loss = torch.tensor(0., requires_grad=True).to(pooled_logits)
+                else:
+                    # classification_loss = classification_loss/number_of_labels
+                    classification_loss = classification_loss
+            elif self.config.problem_type == "multi_label_classification":
+                loss_fct = BCEWithLogitsLoss()
+                classification_loss = loss_fct(pooled_logits, labels)
+        
+        total_loss = classification_loss + real_fake_loss
+        
+        if not return_dict:
+            output = (pooled_logits, pooled_real_fake_logits) + transformer_outputs[1:]
+            return ((total_loss,) + output) if total_loss is not None else output
+
+        return SequenceClassifierOutputWithPast(
+            loss=total_loss,
+            logits=pooled_logits,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+        )    
+
 
 def setup_wandb(train_config, fsdp_config, llama_config, **kwargs):
     try:
@@ -146,7 +283,7 @@ def main(**kwargs):
         llama_config = LlamaConfig.from_pretrained(model_config_path)
         llama_config.use_cache = use_cache
         print(f"model_config:{llama_config}")
-        model = LlamaForSequenceClassification(llama_config) #TODO: LOAD FROM CKPT
+        model = LlamaForSequenceDoubleClassification(llama_config) #TODO: LOAD FROM CKPT
 
         model_checkpoint = torch.load(train_config.trained_checkpoint_path) #, , map_location = 'cuda:{}'.format(local_rank)
         
