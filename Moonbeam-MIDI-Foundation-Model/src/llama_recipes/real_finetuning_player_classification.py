@@ -56,6 +56,25 @@ from llama_recipes.utils.train_utils import (
 )
 from accelerate.utils import is_xpu_available
 
+"""カスタムモデルの出力クラス"""
+from transformers.utils import ModelOutput
+from dataclasses import dataclass
+
+@dataclass
+class DoubleClassifierOutputWithPast(ModelOutput):
+    """
+    Output class for models with two classification heads.
+    """
+    loss: Optional[torch.FloatTensor] = None
+    classification_loss: Optional[torch.FloatTensor] = None
+    real_fake_loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    real_fake_logits: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+
+
 """ソース真偽判定用線形層追加モデル"""
 from torch import nn
 from typing import List, Optional, Tuple, Union
@@ -64,6 +83,7 @@ from transformers.models.llama.modeling_llama import LLAMA_INPUTS_DOCSTRING
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.utils import add_start_docstrings_to_model_forward
 from transformers.cache_utils import Cache
+
 class LlamaForSequenceDoubleClassification(
     LlamaPreTrainedModel
 ):
@@ -184,9 +204,12 @@ class LlamaForSequenceDoubleClassification(
             output = (pooled_logits, pooled_real_fake_logits) + transformer_outputs[1:]
             return ((total_loss,) + output) if total_loss is not None else output
 
-        return SequenceClassifierOutputWithPast(
+        return DoubleClassifierOutputWithPast(
             loss=total_loss,
+            classification_loss=classification_loss,
+            real_fake_loss=real_fake_loss,
             logits=pooled_logits,
+            real_fake_logits=pooled_real_fake_logits,
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
