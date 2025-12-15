@@ -60,6 +60,7 @@ from accelerate.utils import is_xpu_available
 from torch import nn
 from typing import List, Optional, Tuple, Union
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from transformers.models.llama.modeling_llama import LLAMA_INPUTS_DOCSTRING
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.utils import add_start_docstrings_to_model_forward
 from transformers.cache_utils import Cache
