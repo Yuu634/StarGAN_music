@@ -74,12 +74,14 @@ class CorpusMaker():
   
   def _get_in_beat_resolution(self):
     # Retrieve the resolution of quarter note based on the dataset name (e.g., 4 means the minimum resolution sets to 16th note)
-    in_beat_resolution_dict = {'BachChorale': 4, 'Pop1k7': 4, 'Pop909': 4, 'SOD': 12, 'LakhClean': 4, 'SymphonyMIDI': 8}
+    """in_beat_resolution_dict = {'BachChorale': 4, 'Pop1k7': 4, 'Pop909': 4, 'SOD': 12, 'LakhClean': 4, 'SymphonyMIDI': 8}
     try:
       self.in_beat_resolution = in_beat_resolution_dict[self.dataset_name]
     except KeyError:
       print(f"Dataset {self.dataset_name} is not supported. use the setting of LakhClean")
-      self.in_beat_resolution = in_beat_resolution_dict['LakhClean']
+      self.in_beat_resolution = in_beat_resolution_dict['LakhClean']"""
+    # 1拍の分割数をデータセットによらず固定に設定
+    self._get_in_beat_resolution = 4
 
   def _get_duration_bins(self):
     # Set up regular duration bins for quantizing note lengths, based on the beat resolution.

@@ -7,7 +7,8 @@ file_path = "../dataset/represented_data/events/events_test/nb8/sample.pkl"  # �
 with open(file_path, "rb") as f:  # "rb" = バイナリ読み込みモード
     data = pickle.load(f)
 
-print(data[1:10])
+for event in data[:200]:
+    print(event['beat'])
 """
 
 file_path = "../dataset/represented_data/tuneidx/tuneidx_test/nb8/sample.npz"  # 読みたい npz ファイルのパス
