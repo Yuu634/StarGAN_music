@@ -16,7 +16,8 @@ class Event2tuneidx():
       num_features: int, 
       in_dir: Path, 
       out_dir: Path, 
-      debug: bool
+      debug: bool,
+      is_hierarchical: bool
   ):
     self.dataset = dataset
     self.encoding_scheme = encoding_scheme
@@ -24,10 +25,14 @@ class Event2tuneidx():
     self.in_dir = in_dir / f"events_{self.dataset}" / self.encoding_name
     self.out_dir = out_dir / f"tuneidx_{self.dataset}" / self.encoding_name
     self.debug = debug
+    self.is_hierarchical = is_hierarchical
 
     vocab_name = {'remi':'LangTokenVocab', 'cp':'MusicTokenVocabCP', 'nb':'MusicTokenVocabNB'}
     selected_vocab_name = vocab_name[encoding_scheme]
-    in_vocab_file_path = out_dir / f"vocab_{dataset}" /f"{encoding_scheme}{num_features}.json"
+    if is_hierarchical:
+      in_vocab_file_path = out_dir / f"vocab_{dataset.split('/')[0]}" /f"{encoding_scheme}{num_features}.json"
+    else:
+      in_vocab_file_path = out_dir / f"vocab_{dataset}" /f"{encoding_scheme}{num_features}.json"
     self.vocab = getattr(vocab_utils, selected_vocab_name)(in_vocab_file_path=in_vocab_file_path, event_data=None,
                                                         encoding_scheme=encoding_scheme, num_features=num_features)
 
@@ -114,13 +119,20 @@ def get_argument_parser():
       action="store_true",
       help="enable debug mode",
   )
+  parser.add_argument(
+      "-h",
+      "--is_hierarchical",
+      default=False,
+      type=bool,
+      help="dataset structure is hierarchical or not",
+  )
   return parser
 
 def main():
   parser = get_argument_parser()
   args = parser.parse_args()
 
-  event2tuneidx = Event2tuneidx(args.dataset, args.encoding, args.num_features, args.in_dir, args.out_dir, args.debug)
+  event2tuneidx = Event2tuneidx(args.dataset, args.encoding, args.num_features, args.in_dir, args.out_dir, args.debug, args.is_hierarchical)
   event2tuneidx.make_tune_in_idx()
 
 if __name__ == "__main__":

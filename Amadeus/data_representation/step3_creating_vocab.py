@@ -52,6 +52,13 @@ def get_argument_parser():
       action="store_true",
       help="enable debug mode",
   )
+  parser.add_argument(
+      "-h",
+      "--is_hierarchical",
+      default=False,
+      type=bool,
+      help="dataset structure is hierarchical or not",
+  )
   return parser
 
 def main():
@@ -60,6 +67,11 @@ def main():
   num_features = args.num_features
   dataset = args.dataset
 
+  if args.is_hierarchical:
+    dataset = dataset.split("/")[0]
+  else:
+    dataset = dataset
+    
   out_vocab_path = args.out_dir / f"vocab_{dataset}"
   out_vocab_path.mkdir(parents=True, exist_ok=True)
   out_vocab_file_path = out_vocab_path / f"{encoding_scheme}{num_features}.json"
