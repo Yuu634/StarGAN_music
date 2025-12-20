@@ -27,7 +27,7 @@ class Event2tuneidx():
 
     vocab_name = {'remi':'LangTokenVocab', 'cp':'MusicTokenVocabCP', 'nb':'MusicTokenVocabNB'}
     selected_vocab_name = vocab_name[encoding_scheme]
-    in_vocab_file_path = Path(f"../vocab/vocab_{dataset}/vocab_{dataset}_{encoding_scheme}{num_features}.json")
+    in_vocab_file_path = out_dir / f"vocab_{dataset}" /f"{encoding_scheme}{num_features}.json"
     self.vocab = getattr(vocab_utils, selected_vocab_name)(in_vocab_file_path=in_vocab_file_path, event_data=None,
                                                         encoding_scheme=encoding_scheme, num_features=num_features)
 

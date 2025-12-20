@@ -62,7 +62,7 @@ def main():
 
   out_vocab_path = args.out_dir / f"vocab_{dataset}"
   out_vocab_path.mkdir(parents=True, exist_ok=True)
-  out_vocab_file_path = out_vocab_path / f"vocab_{dataset}_{encoding_scheme}{num_features}.json"
+  out_vocab_file_path = out_vocab_path / f"{encoding_scheme}{num_features}.json"
   
   events_path = Path(args.in_dir / f"events_{dataset}" / f"{encoding_scheme}{num_features}")
   vocab_name = {'remi':'LangTokenVocab', 'cp':'MusicTokenVocabCP', 'nb':'MusicTokenVocabNB'}
