@@ -81,7 +81,7 @@ class CorpusMaker():
       print(f"Dataset {self.dataset_name} is not supported. use the setting of LakhClean")
       self.in_beat_resolution = in_beat_resolution_dict['LakhClean']"""
     # 1拍の分割数をデータセットによらず固定に設定
-    self._get_in_beat_resolution = 4
+    self.in_beat_resolution = 4
 
   def _get_duration_bins(self):
     # Set up regular duration bins for quantizing note lengths, based on the beat resolution.
