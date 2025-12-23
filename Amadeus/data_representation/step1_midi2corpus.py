@@ -17,6 +17,7 @@ from tqdm import tqdm
 import miditoolkit
 from miditoolkit.midi.containers import Marker, Instrument
 from chorder import Dechorder
+import gc
 
 from constants import NUM2PITCH, PROGRAM_INSTRUMENT_MAP, INSTRUMENT_PROGRAM_MAP
 
@@ -173,8 +174,8 @@ class CorpusMaker():
       # reverse the list to process the latest files first
       self.midi_list.reverse()
       print(f"length of midi list after filtering: ", len(self.midi_list))
-      with Pool(16) as p:
-        for message in tqdm(p.imap(self._mp_midi2corpus, self.midi_list, 1000), total=len(self.midi_list)):
+      with Pool(8) as p:
+        for message in tqdm(p.imap(self._mp_midi2corpus, self.midi_list, 50), total=len(self.midi_list)):
           if message == "error":
             broken_counter += 1
           elif message == "success":
@@ -206,14 +207,18 @@ class CorpusMaker():
           midi_save_path = midi_save_dir / file_path.name  # Keep original MIDI filename
           midi_obj.dump(midi_save_path)
 
+          del midi_obj.instruments[:]
           del midi_obj, corpus
+          gc.collect()
           return "success"
 
       except (OSError, EOFError, ValueError, KeyError, AssertionError) as e:
           print(f"Error processing {file_path.name}: {e}")
+          gc.collect()
           return "error"
       except Exception as e:
           print(f"Unexpected error in {file_path.name}: {e}")
+          gc.collect()
           return "error"
   def _check_length(self, last_time:float):
     if last_time < self.min_last_time:

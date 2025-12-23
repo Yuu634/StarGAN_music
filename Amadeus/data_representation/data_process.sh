@@ -5,7 +5,7 @@ BASE_DATASET="lmd_full"
 NUM_FEATURES=5
 ENCODING="nb"
 OUT_DIR="../dataset/MidiCaps/corpus/"
-SUBDIRS=("0" "1" "2" "3" "4" "5" "6" "7" "8" "9" "a" "b" "c" "d" "e" "f")
+SUBDIRS=("2" "3" "4" "5" "6" "7" "8" "9" "a" "b" "c" "d" "e" "f")
 
 for SUBDIR in "${SUBDIRS[@]}"; do
     DATASET="${BASE_DATASET}/${SUBDIR}"
