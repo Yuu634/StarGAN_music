@@ -23,29 +23,20 @@ def main(config):
         os.makedirs(config.result_dir)
 
     # Data loader.
-    celeba_loader = None
-    rafd_loader = None
-
-    if config.dataset in ['CelebA', 'Both']:
-        celeba_loader = get_loader(config.celeba_image_dir, config.attr_path, config.selected_attrs,
-                                   config.celeba_crop_size, config.image_size, config.batch_size,
-                                   'CelebA', config.mode, config.num_workers)
-    if config.dataset in ['RaFD', 'Both']:
-        rafd_loader = get_loader(config.rafd_image_dir, None, None,
-                                 config.rafd_crop_size, config.image_size, config.batch_size,
-                                 'RaFD', config.mode, config.num_workers)
+    score_loader = get_loader(config.score_dir, config.attr_path, config.selected_attrs,
+                              config.batch_size,'MidiCaps', config.mode, config.num_workers)
     
 
     # Solver for training and testing StarGAN.
-    solver = Solver(celeba_loader, rafd_loader, config)
-
+    solver = Solver(score_loader, config)
+    
     if config.mode == 'train':
-        if config.dataset in ['CelebA', 'RaFD']:
+        if config.dataset in ['MidiCaps']:
             solver.train()
         elif config.dataset in ['Both']:
             solver.train_multi()
     elif config.mode == 'test':
-        if config.dataset in ['CelebA', 'RaFD']:
+        if config.dataset in ['MidiCaps']:
             solver.test()
         elif config.dataset in ['Both']:
             solver.test_multi()
@@ -68,9 +59,19 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_rec', type=float, default=10, help='weight for reconstruction loss')
     parser.add_argument('--lambda_gp', type=float, default=10, help='weight for gradient penalty')
     
+    # Generator configuration.
+    parser.add_argument('--g_modelpath', type=str, default="../Amadeus/models/Amadeus-S", help='path to the generator model')
+    parser.add_argument('--generate_length', type=int, default=100, help='length of the generated sequence')
+    parser.add_argument('--sampling_method', type=str, choices=('top_p', 'top_k'), default="top_k", help='sampling method for generation')
+    parser.add_argument('--threshold', type=float, default=0.99, help='threshold for sampling method')
+    parser.add_argument('--temperature', type=float, default=1.15, help='temperature for sampling method')
+    
+    # Discriminator configuration.
+    parser.add_argument('--d_modelpath', type=str, default="../Moonbeam-MIDI-Foundation-Model/models/emotion_classification-v1", help='path to the discriminator model')
+    
     # Training configuration.
     parser.add_argument('--dataset', type=str, default='CelebA', choices=['CelebA', 'RaFD', 'Both'])
-    parser.add_argument('--batch_size', type=int, default=16, help='mini-batch size')
+    parser.add_argument('--batch_size', type=int, default=1, help='mini-batch size')
     parser.add_argument('--num_iters', type=int, default=200000, help='number of total iterations for training D')
     parser.add_argument('--num_iters_decay', type=int, default=100000, help='number of iterations for decaying lr')
     parser.add_argument('--g_lr', type=float, default=0.0001, help='learning rate for G')
@@ -79,8 +80,8 @@ if __name__ == '__main__':
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for Adam optimizer')
     parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam optimizer')
     parser.add_argument('--resume_iters', type=int, default=None, help='resume training from this step')
-    parser.add_argument('--selected_attrs', '--list', nargs='+', help='selected attributes for the CelebA dataset',
-                        default=['Black_Hair', 'Blond_Hair', 'Brown_Hair', 'Male', 'Young'])
+    parser.add_argument('--selected_attrs', '--list', nargs='+', help='selected attributes for Music dataset',
+                        default=['funk', 'celtic', 'instrumentalpop', 'ambient', 'reggae', 'popfolk', 'dance', 'rock', 'classical', 'instrumentalrock', 'folk', 'poprock', 'indie', 'hiphop', 'blues', 'experimental', 'punkrock', 'jazz', 'electronic', 'techno', 'jazzfusion', 'pop', 'alternative', 'electropop', 'soundtrack', 'trance', 'house', 'metal', 'world', 'symphonic', 'lounge', 'easylistening', 'orchestral', 'country', 'newage', 'latin', 'drumnbass', '80s', '90s', 'swing', 'chillout', 'synthpop', 'movie', 'christmas', 'heavy', 'corporate', 'action', 'romantic', 'energetic', 'background', 'children', 'calm', 'adventure', 'motivational', 'summer', 'funny', 'dramatic', 'cool', 'positive', 'emotional', 'holiday', 'deep', 'love', 'dark', 'dream', 'advertising', 'happy', 'soundscape', 'film', 'melodic', 'drama', 'uplifting', 'epic', 'ballad', 'sad', 'relaxing', 'party', 'trailer', 'inspiring', 'soft', 'slow', 'game', 'retro', 'fun', 'meditative', 'sport', 'space', 'commercial', 'documentary', 'upbeat', 'Eb major', 'B major', 'Bb major', 'F# minor', 'F# major', 'G# minor', 'A major', 'B minor', 'E minor', 'D minor', 'F minor', 'G minor', 'F major', 'Eb minor', 'C major', 'A minor', 'G major', 'D major', 'C# major', 'Bb minor', 'Ab major', 'C# minor', 'C minor', 'E major'])
 
     # Test configuration.
     parser.add_argument('--test_iters', type=int, default=200000, help='test model from this step')
@@ -91,9 +92,8 @@ if __name__ == '__main__':
     parser.add_argument('--use_tensorboard', type=str2bool, default=True)
 
     # Directories.
-    parser.add_argument('--celeba_image_dir', type=str, default='data/celeba/images')
-    parser.add_argument('--attr_path', type=str, default='data/celeba/list_attr_celeba.txt')
-    parser.add_argument('--rafd_image_dir', type=str, default='data/RaFD/train')
+    parser.add_argument('--score_dir', type=str, default='../Amadeus/dataset/MidiCaps/tuneidx_')
+    parser.add_argument('--attr_path', type=str, default='../Dataset/MidiCaps/train.json')
     parser.add_argument('--log_dir', type=str, default='stargan/logs')
     parser.add_argument('--model_save_dir', type=str, default='stargan/models')
     parser.add_argument('--sample_dir', type=str, default='stargan/samples')

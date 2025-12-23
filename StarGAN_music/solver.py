@@ -10,19 +10,21 @@ import time
 import datetime
 import re
 from Amadeus.Amadeus import model_zoo
+from transformers import T5Tokenizer, T5EncoderModel
 import sys
 sys.path.append("Moonbeam-MIDI-Foundation-Model")
-from inference import MusicEmotionClassifier
+from inference import ScoreArrangeDomainClassifier
+sys.path.append("../Amadeus")
+from generate import load_resources
 
 class Solver(object):
     """Solver for training and testing StarGAN."""
 
-    def __init__(self, celeba_loader, rafd_loader, config):
+    def __init__(self, score_loader, config):
         """Initialize configurations."""
 
         # Data loader.
-        self.celeba_loader = celeba_loader
-        self.rafd_loader = rafd_loader
+        self.score_loader = score_loader
 
         # Model configurations.
         self.c_dim = config.c_dim
@@ -35,6 +37,16 @@ class Solver(object):
         self.lambda_cls = config.lambda_cls
         self.lambda_rec = config.lambda_rec
         self.lambda_gp = config.lambda_gp
+        
+        # Generator configurations.
+        self.g_modelpath = config.g_modelpath
+        self.generate_length = config.generate_length
+        self.sampling_method = config.sampling_method
+        self.threshold = config.threshold
+        self.temperature = config.temperature
+        
+        # Discriminator configurations.
+        self.d_modelpath = config.d_modelpath
 
         # Training configurations.
         self.dataset = config.dataset
@@ -75,52 +87,29 @@ class Solver(object):
 
     def build_model(self):
         """Create a generator and a discriminator."""
-        if self.dataset in ['CelebA', 'RaFD']:
+        if self.dataset in ['MidiCaps']:
             """self.G = Generator(self.g_conv_dim, self.c_dim, self.g_repeat_num)"""
-            self.G = getattr(model_zoo, "AmadeusModel")(
-                vocab=vocab,
-                input_length=config.train_params.input_length,
-                prediction_order=prediction_order,
-                input_embedder_name=nn_params.input_embedder_name,
-                main_decoder_name=nn_params.main_decoder_name,
-                sub_decoder_name=nn_params.sub_decoder_name,
-                sub_decoder_depth=nn_params.sub_decoder.num_layer if hasattr(nn_params, 'sub_decoder') else 0,
-                sub_decoder_enricher_use=nn_params.sub_decoder.feature_enricher_use \
-                    if hasattr(nn_params, 'sub_decoder') and hasattr(nn_params.sub_decoder, 'feature_enricher_use') else False,
-                dim=nn_params.main_decoder.dim_model,
-                heads=nn_params.main_decoder.num_head,
-                depth=nn_params.main_decoder.num_layer,
-                dropout=nn_params.model_dropout,
-            )
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            config, self.G, vocab = load_resources(self.g_modelpath, device)
+            
             """self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim, self.d_repeat_num)"""
-            self.D = MusicEmotionClassifier(
-                pretrained_checkpoint="models/pretrained/moonbeam_839M.pt",
-                lora_adapter_path="models/emotion_classification-v1",
-                config_path="src/llama_recipes/configs/player_classification_config.json",
+            self.D = ScoreArrangeDomainClassifier(
+                pretrained_checkpoint="../Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_839M.pt",
+                lora_adapter_path=self.d_modelpath,
+                config_path="../Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config.json",
                 device="cuda" if torch.cuda.is_available() else "cpu"
+                selected_attr = self.selected_attrs
             )
         elif self.dataset in ['Both']:
             """self.G = Generator(self.g_conv_dim, self.c_dim+self.c2_dim+2, self.g_repeat_num)   # 2 for mask vector."""
-            self.G = getattr(model_zoo, "AmadeusModel")(
-                vocab=vocab,
-                input_length=config.train_params.input_length,
-                prediction_order=prediction_order,
-                input_embedder_name=nn_params.input_embedder_name,
-                main_decoder_name=nn_params.main_decoder_name,
-                sub_decoder_name=nn_params.sub_decoder_name,
-                sub_decoder_depth=nn_params.sub_decoder.num_layer if hasattr(nn_params, 'sub_decoder') else 0,
-                sub_decoder_enricher_use=nn_params.sub_decoder.feature_enricher_use \
-                    if hasattr(nn_params, 'sub_decoder') and hasattr(nn_params.sub_decoder, 'feature_enricher_use') else False,
-                dim=nn_params.main_decoder.dim_model,
-                heads=nn_params.main_decoder.num_head,
-                depth=nn_params.main_decoder.num_layer,
-                dropout=nn_params.model_dropout,
-            )
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            config, self.G, vocab = load_resources(self.g_modelpath, device)
+            
             """self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim+self.c2_dim, self.d_repeat_num)"""
-            self.D = MusicEmotionClassifier(
-                pretrained_checkpoint="models/pretrained/moonbeam_839M.pt",
-                lora_adapter_path="models/emotion_classification-v1",
-                config_path="src/llama_recipes/configs/player_classification_config.json",
+            self.D = ScoreArrangeDomainClassifier(
+                pretrained_checkpoint="../Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_839M.pt",
+                lora_adapter_path=self.d_modelpath,
+                config_path="../Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config.json",
                 device="cuda" if torch.cuda.is_available() else "cpu"
             )
 
@@ -194,27 +183,10 @@ class Solver(object):
 
     def create_labels(self, c_org, c_dim=5, dataset='CelebA', selected_attrs=None):
         """Generate target domain labels for debugging and testing."""
-        # Get hair color indices.
-        if dataset == 'CelebA':
-            hair_color_indices = []
-            for i, attr_name in enumerate(selected_attrs):
-                if attr_name in ['Black_Hair', 'Blond_Hair', 'Brown_Hair', 'Gray_Hair']:
-                    hair_color_indices.append(i)
-
+        c_dim = len(c_org)
         c_trg_list = []
         for i in range(c_dim):
-            if dataset == 'CelebA':
-                c_trg = c_org.clone()
-                if i in hair_color_indices:  # Set one hair color to 1 and the rest to 0.
-                    c_trg[:, i] = 1
-                    for j in hair_color_indices:
-                        if j != i:
-                            c_trg[:, j] = 0
-                else:
-                    c_trg[:, i] = (c_trg[:, i] == 0)  # Reverse attribute value.
-            elif dataset == 'RaFD':
-                c_trg = self.label2onehot(torch.ones(c_org.size(0))*i, c_dim)
-
+            c_trg = self.label2onehot(torch.ones(c_org.size(0))*i, c_dim)
             c_trg_list.append(c_trg.to(self.device))
         return c_trg_list
 
@@ -225,7 +197,7 @@ class Solver(object):
         elif dataset == 'RaFD':
             return F.cross_entropy(logit, target)
 
-    def amadeus_to_moonbeam(amadeus_tokens, time_resolution=10, default_tempo=120, in_beat_resolution=4):
+    def amadeus_to_moonbeam(self, amadeus_tokens, time_resolution=10, default_tempo=120, in_beat_resolution=4):
         # (Beat + 小節数) * Tempo → onset(ms)
         # duration * Tempo → duration(ms)
         # pitch → octave*12 + pitch_class
@@ -398,14 +370,7 @@ class Solver(object):
     def train(self):
         """Train StarGAN within a single dataset."""
         # Set data loader.
-        
-        """
-        if self.dataset == 'CelebA':
-            data_loader = self.celeba_loader
-        elif self.dataset == 'RaFD':
-            data_loader = self.rafd_loader
-        """
-        data_loader = midi_loader
+        data_loader = self.score_loader
 
         # Fetch fixed inputs for debugging.
         data_iter = iter(data_loader)
@@ -438,17 +403,19 @@ class Solver(object):
             except:
                 data_iter = iter(data_loader)
                 x_real, label_org = next(data_iter)
-
+            label_org = label_org.squeeze(0)
+            
             # Generate target domain labels randomly.
-            rand_idx = torch.randperm(label_org.size(0))
-            label_trg = label_org[rand_idx]
+            label_trg = label_org.clone()
+            false_indices = (label_org == False).nonzero(as_tuple=True)[0]
+            
+            if len(false_indices) > 0:
+                # ランダムにFalseの1つをTrueに変更
+                random_false_idx = false_indices[torch.randint(len(false_indices), (1,)).item()]
+                label_trg[random_false_idx] = True
 
-            if self.dataset == 'CelebA':
-                c_org = label_org.clone()
-                c_trg = label_trg.clone()
-            elif self.dataset == 'RaFD':
-                c_org = self.label2onehot(label_org, self.c_dim)
-                c_trg = self.label2onehot(label_trg, self.c_dim)
+            c_org = label_org.clone()
+            c_trg = label_trg.clone()
 
             x_real = x_real.to(self.device)           # Input images.
             c_org = c_org.to(self.device)             # Original domain labels.
@@ -462,23 +429,35 @@ class Solver(object):
 
             # Compute loss with real images.
             """out_src, out_cls = self.D(x_real)"""
-            result = self.D.predict(str(npy_path), return_probabilities=False)
-            out_src, out_cls = result['predicted_class']
+            x_real_D = self.amadeus_to_moonbeam(x_real)
+            result = self.D.predict(x_real_D, return_probabilities=False)
+            out_src, out_cls = result['predicted_class_realfake'], result['predicted_class']
             
             d_loss_real = - torch.mean(out_src)
             d_loss_cls = self.classification_loss(out_cls, label_org, self.dataset)
 
             # Compute loss with fake images.
             """x_fake = self.G(x_real, c_trg)"""
+            prompt = self.selected_attrs[random_false_idx]
+            
+            text_encoder_model = 'google/flan-t5-large'
+            tokenizer = T5Tokenizer.from_pretrained(text_encoder_model)
+            encoder = T5EncoderModel.from_pretrained(text_encoder_model).to(self.device)
+            context = tokenizer(prompt, return_tensors='pt',
+                                padding='max_length', truncation=True, max_length=128).to(self.device)
+            context = encoder(**context).last_hidden_state
+            
+            x_real = torch.tensor(x_real, dtype=torch.long).to(self.device)
             x_fake = self.G.generate(
-                    0, generation_length, condition=None, num_target_measures=None,
-                    sampling_method=sampling_method, threshold=threshold,
-                    temperature=temperature, context=context, input_note=input_note
+                    0, self.generate_length, condition=None, num_target_measures=None,
+                    sampling_method=self.sampling_method, threshold=self.threshold,
+                    temperature=self.temperature, context=context, input_note=x_real
                 )
             
             """out_src, out_cls = self.D(x_fake.detach())"""
-            result = self.D.predict(str(npy_path), return_probabilities=False)
-            out_src, out_cls = result['predicted_class']
+            x_fake_D = self.amadeus_to_moonbeam(x_fake)
+            result = self.D.predict(x_fake_D, return_probabilities=False)
+            out_src, out_cls = result['predicted_class_realfake'], result['predicted_class']
             
             d_loss_fake = torch.mean(out_src)
 
@@ -486,8 +465,9 @@ class Solver(object):
             alpha = torch.rand(x_real.size(0), 1, 1, 1).to(self.device)
             x_hat = (alpha * x_real.data + (1 - alpha) * x_fake.data).requires_grad_(True)
             """out_src, _ = self.D(x_hat)"""
-            result = self.D.predict(str(npy_path), return_probabilities=False)
-            out_src, _ = result['predicted_class']
+            x_hat_D = self.amadeus_to_moonbeam(x_hat)
+            result = self.D.predict(x_hat_D, return_probabilities=False)
+            out_src, _ = result['predicted_class_realfake'], result['predicted_class']
             
             d_loss_gp = self.gradient_penalty(out_src, x_hat)
 
@@ -513,16 +493,16 @@ class Solver(object):
                 """x_fake = self.G(x_real, c_trg)"""
                 # 生成譜面の音符属性表現列を取得
                 x_fake = self.G.generate(
-                    0, generation_length, condition=None, num_target_measures=None,
-                    sampling_method=sampling_method, threshold=threshold,
-                    temperature=temperature, context=context, input_note=input_note
+                    0, self.generate_length, condition=None, num_target_measures=None,
+                    sampling_method=self.sampling_method, threshold=self.threshold,
+                    temperature=self.temperature, context=context, input_note=x_real
                 )
                 # ＜Amadeus表現⇒Moonbeam表現へ変換＞
                 x_fake_D = self.amadeus_to_moonbeam(x_fake)
                 
                 """out_src, out_cls = self.D(x_fake)"""
-                result = self.D.predict(str(npy_path), return_probabilities=False)
-                out_src, out_cls = result['predicted_class']
+                result = self.D.predict(x_fake_D, return_probabilities=False)
+                out_src, out_cls = result['predicted_class_realfake'], result['predicted_class']
                 
                 g_loss_fake = - torch.mean(out_src)
                 g_loss_cls = self.classification_loss(out_cls, label_trg, self.dataset)
@@ -530,9 +510,9 @@ class Solver(object):
                 # Target-to-original domain.
                 """x_reconst = self.G(x_fake, c_org)"""
                 x_reconst = self.G.generate(
-                    0, generation_length, condition=None, num_target_measures=None,
-                    sampling_method=sampling_method, threshold=threshold,
-                    temperature=temperature, context=context, input_note=input_note
+                    0, self.generate_length, condition=None, num_target_measures=None,
+                    sampling_method=self.sampling_method, threshold=self.threshold,
+                    temperature=self.temperature, context=context, input_note=x_fake
                 )
                 
                 g_loss_rec = torch.mean(torch.abs(x_real - x_reconst))
