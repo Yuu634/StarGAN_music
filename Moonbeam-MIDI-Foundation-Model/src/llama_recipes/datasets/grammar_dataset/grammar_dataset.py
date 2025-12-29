@@ -4,8 +4,7 @@
 # For dataset details visit: https://huggingface.co/datasets/jfleg
 # For download and preparation see: recipes/ft_datasets/grammar_dataset/grammar_dataset_process.ipynb
 
-
-from datasets import load_dataset
+import sys
 from pathlib import Path
 
 from torch.utils.data import Dataset
@@ -17,7 +16,9 @@ class grammar(Dataset):
         tokenizer,
         csv_name=None,
     ):
-
+        BASE_DIR = Path(__file__).resolve().parent.parent.parent
+        sys.path.insert(0, str(BASE_DIR))
+        from llama_recipes.datasets import load_dataset
         try:
             self.dataset = load_dataset(
                 "csv",

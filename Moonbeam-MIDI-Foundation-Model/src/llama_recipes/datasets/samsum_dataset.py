@@ -4,7 +4,11 @@
 # For dataset details visit: https://huggingface.co/datasets/samsum
 
 import copy
-import datasets
+import sys
+from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+from llama_recipes import datasets
 
 
 def get_preprocessed_samsum(dataset_config, tokenizer, split):

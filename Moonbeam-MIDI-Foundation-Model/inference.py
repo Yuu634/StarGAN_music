@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from pathlib import Path
-from transformers import LlamaConfig
+from transformers import LlamaConfig, LlamaForSequenceClassification
 from peft import PeftModel, LoraConfig
 from typing import List, Dict
 import sys
@@ -35,13 +35,15 @@ class ScoreArrangeDomainClassifier:
         # 1. 設定ファイルを読み込み
         llama_config = LlamaConfig.from_pretrained(self.config_path)
         llama_config.use_cache = False
-        llama_config.num_labels = 
+        if self.selected_attr:
+            llama_config.num_labels = len(self.selected_attr)
         
         print(f"Model config: {llama_config}")
         print(f"Number of labels: {llama_config.num_labels}")
         
         # 2. 分類モデルを作成
         self.model = LlamaForSequenceDoubleClassification(llama_config)
+        #self.model = LlamaForSequenceClassification(llama_config)
         
         # 3. 事前学習済み重みを読み込み
         print(f"Loading pretrained weights from {self.pretrained_checkpoint}")
@@ -106,7 +108,7 @@ class ScoreArrangeDomainClassifier:
         print(f"Classification token: {self.classification_token}")
         print(f"Pad token: {self.pad_token}")
     
-    def npy_to_tokens(self, tokens: np.ndarray, max_length: int = 133) -> torch.Tensor:
+    def npy_to_tokens(self, tokens: np.ndarray, max_length: int = 1024) -> torch.Tensor:
         """
         npyファイル（前処理済みトークン）を読み込んでテンソルに変換
         
@@ -157,11 +159,11 @@ class ScoreArrangeDomainClassifier:
         print(f"Final onset range: [{tokens[:, 0].min()}, {tokens[:, 0].max()}]")
         
         # Tensorに変換 [1, seq_len, 6]
-        tokens = torch.from_numpy(tokens).long().unsqueeze(0)
+        tokens = torch.from_numpy(tokens).long()#.unsqueeze(0)
         
         return tokens
     
-    def npy_to_tokens_chunked(self, tokens: np.ndarray, chunk_length: int = 133, stride: int = 130) -> List[torch.Tensor]:
+    def npy_to_tokens_chunked(self, tokens: np.ndarray, chunk_length: int = 1024, stride: int = 1024) -> List[torch.Tensor]:
         """
         npyファイルを非オーバーラップでチャンク化
         onset値を相対時間に正規化してから分割
@@ -230,7 +232,7 @@ class ScoreArrangeDomainClassifier:
         self, 
         tokens: np.ndarray,
         return_probabilities: bool = False,
-        chunk_length: int = 133
+        chunk_length: int = 1024
     ) -> Dict:
         """
         npyファイルから感情分類を予測（チャンキング対応）
@@ -372,9 +374,9 @@ def main():
     
     # 分類器を初期化
     classifier = ScoreArrangeDomainClassifier(
-        pretrained_checkpoint="/mnt/kiso-qnap5/obara/Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_839M.pt",
-        lora_adapter_path="/mnt/kiso-qnap5/obara/Moonbeam-MIDI-Foundation-Model/models/emotion_classification-v3",
-        config_path="/mnt/kiso-qnap5/obara/Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config.json",
+        pretrained_checkpoint="/mnt/kiso-qnap5/obara/StarGAN_music/Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_839M.pt",
+        lora_adapter_path="/mnt/kiso-qnap5/obara/StarGAN_music/Moonbeam-MIDI-Foundation-Model/models/emotion_classification-v3",
+        config_path="/mnt/kiso-qnap5/obara/StarGAN_music/Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config.json",
         device="cuda" if torch.cuda.is_available() else "cpu"
     )
     
@@ -384,7 +386,7 @@ def main():
     print("="*60)
     
     # CSVファイルを読み込み
-    csv_path = "/mnt/kiso-qnap5/obara/Moonbeam-MIDI-Foundation-Model/processed_datasets/classification/emopia2.2_1071_clips/train_test_split.csv"
+    csv_path = "/mnt/kiso-qnap5/obara/StarGAN_music/Moonbeam-MIDI-Foundation-Model/processed_datasets/classification/emopia2.2_1071_clips/train_test_split.csv"
     df = pd.read_csv(csv_path)
     
     # testデータのみを抽出
@@ -395,7 +397,7 @@ def main():
     print(test_df['label'].value_counts().sort_index())
     
     # npyファイルのベースパス
-    base_path = Path("/mnt/kiso-qnap5/obara/Moonbeam-MIDI-Foundation-Model/processed_datasets/classification/emopia2.2_1071_clips/processed")
+    base_path = Path("/mnt/kiso-qnap5/obara/StarGAN_music/Moonbeam-MIDI-Foundation-Model/processed_datasets/classification/emopia2.2_1071_clips/processed")
     
     # 推論結果を格納
     predictions = []
@@ -489,7 +491,7 @@ def main():
     for i in range(4):
         print(f"Pred {i:1d}  ", end="")
     print()
-    
+    """
     for i in range(4):
         print(f"True {i}: ", end="")
         for j in range(4):
@@ -505,6 +507,7 @@ def main():
             print(f"  - {file}")
         if len(failed_files) > 10:
             print(f"  ... and {len(failed_files)-10} more files")
+    """
 
 
 if __name__ == "__main__":

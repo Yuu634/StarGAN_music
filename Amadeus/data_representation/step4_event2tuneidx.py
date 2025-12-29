@@ -14,6 +14,7 @@ class Event2tuneidx():
       dataset: str, 
       encoding_scheme: str, 
       num_features: int, 
+      vocab_path: Path,
       in_dir: Path, 
       out_dir: Path, 
       debug: bool,
@@ -22,6 +23,7 @@ class Event2tuneidx():
     self.dataset = dataset
     self.encoding_scheme = encoding_scheme
     self.encoding_name = encoding_scheme + str(num_features)
+    self.vocab_path = vocab_path
     self.in_dir = in_dir / f"events_{self.dataset}" / self.encoding_name
     self.out_dir = out_dir / f"tuneidx_{self.dataset}" / self.encoding_name
     self.debug = debug
@@ -29,7 +31,9 @@ class Event2tuneidx():
 
     vocab_name = {'remi':'LangTokenVocab', 'cp':'MusicTokenVocabCP', 'nb':'MusicTokenVocabNB'}
     selected_vocab_name = vocab_name[encoding_scheme]
-    if is_hierarchical:
+    if vocab_path is not None:
+      in_vocab_file_path = vocab_path
+    elif is_hierarchical:
       in_vocab_file_path = out_dir / f"vocab_{dataset.split('/')[0]}" /f"{encoding_scheme}{num_features}.json"
     else:
       in_vocab_file_path = out_dir / f"vocab_{dataset}" /f"{encoding_scheme}{num_features}.json"
@@ -101,6 +105,12 @@ def get_argument_parser():
       help="number of features",
   )
   parser.add_argument(
+      "--vocab_path",
+      default=False,
+      type=Path,
+      help="vocab path if pretrained vocabulary is used",
+  )
+  parser.add_argument(
       "-i",
       "--in_dir",
       default="../dataset/represented_data/events/",
@@ -120,7 +130,6 @@ def get_argument_parser():
       help="enable debug mode",
   )
   parser.add_argument(
-      "-h",
       "--is_hierarchical",
       default=False,
       type=bool,
@@ -132,7 +141,7 @@ def main():
   parser = get_argument_parser()
   args = parser.parse_args()
 
-  event2tuneidx = Event2tuneidx(args.dataset, args.encoding, args.num_features, args.in_dir, args.out_dir, args.debug, args.is_hierarchical)
+  event2tuneidx = Event2tuneidx(args.dataset, args.encoding, args.num_features, args.vocab_path, args.in_dir, args.out_dir, args.debug, args.is_hierarchical)
   event2tuneidx.make_tune_in_idx()
 
 if __name__ == "__main__":

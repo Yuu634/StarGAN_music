@@ -53,7 +53,6 @@ def get_argument_parser():
       help="enable debug mode",
   )
   parser.add_argument(
-      "-h",
       "--is_hierarchical",
       default=False,
       type=bool,
@@ -76,10 +75,15 @@ def main():
   out_vocab_path.mkdir(parents=True, exist_ok=True)
   out_vocab_file_path = out_vocab_path / f"{encoding_scheme}{num_features}.json"
   
-  events_path = Path(args.in_dir / f"events_{dataset}" / f"{encoding_scheme}{num_features}")
   vocab_name = {'remi':'LangTokenVocab', 'cp':'MusicTokenVocabCP', 'nb':'MusicTokenVocabNB'}
   selected_vocab_name = vocab_name[encoding_scheme]
-  event_data = sorted(list(events_path.rglob("*.pkl")))
+  if args.is_hierarchical:
+    events_path = Path(args.in_dir / f"events_{dataset}")
+    event_data = sorted(list(events_path.rglob(f"{encoding_scheme}{num_features}/*.pkl")))
+  else:
+    events_path = Path(args.in_dir / f"events_{dataset}" / f"{encoding_scheme}{num_features}")
+    event_data = sorted(list(events_path.rglob("*.pkl")))
+  
   if event_data == []:
     print(f"No event files found in {events_path}. Please check the directory.")
     event_data = sorted(list(events_path.glob("*.pkli")))

@@ -1,24 +1,28 @@
 import torch
 import numpy as np
 from pathlib import Path
-from transformers import LlamaConfig, LlamaForSequenceClassification
+from transformers import LlamaConfig
 from peft import PeftModel, LoraConfig
 from typing import List, Dict
+import sys
+from src.llama_recipes.real_finetuning_player_classification import LlamaForSequenceDoubleClassification
 
-class MusicEmotionClassifier:
-    """Moonbeam事前学習モデル + LoRAで感情分類を行うクラス"""
+class ScoreArrangeDomainClassifier:
+    """Moonbeam事前学習モデル + LoRAで編曲ドメイン分類"""
     
     def __init__(
         self,
         pretrained_checkpoint: str = "models/pretrained/moonbeam_839M.pt",
         lora_adapter_path: str = "models/emotion_classification-v1",
         config_path: str = "src/llama_recipes/configs/player_classification_config.json",
-        device: str = "cuda"
+        device: str = "cuda",
+        selected_attr: List[str] = None,
     ):
         self.device = device
         self.config_path = config_path
         self.pretrained_checkpoint = pretrained_checkpoint
         self.lora_adapter_path = lora_adapter_path
+        self.selected_attr = selected_attr
         
         # モデルとトークナイザーを初期化
         self._load_model()
@@ -31,12 +35,13 @@ class MusicEmotionClassifier:
         # 1. 設定ファイルを読み込み
         llama_config = LlamaConfig.from_pretrained(self.config_path)
         llama_config.use_cache = False
+        llama_config.num_labels = 4
         
         print(f"Model config: {llama_config}")
         print(f"Number of labels: {llama_config.num_labels}")
         
         # 2. 分類モデルを作成
-        self.model = LlamaForSequenceClassification(llama_config)
+        self.model = LlamaForSequenceDoubleClassification(llama_config)
         
         # 3. 事前学習済み重みを読み込み
         print(f"Loading pretrained weights from {self.pretrained_checkpoint}")
@@ -101,119 +106,18 @@ class MusicEmotionClassifier:
         print(f"Classification token: {self.classification_token}")
         print(f"Pad token: {self.pad_token}")
     
-    def normalize_onset_tokens(self, tokens: np.ndarray) -> np.ndarray:
-        """
-        onset値を相対時間（差分）に変換し、語彙サイズ内に収める
-        generation.pyの処理と同様に、累積時間を差分に変換
-        
-        Args:
-            tokens: [seq_len, 6] shape のトークン配列
-        
-        Returns:
-            normalized_tokens: 正規化後のトークン配列
-        """
-        normalized_tokens = tokens.copy()
-        
-        # onset列（0列目）を差分に変換
-        onset_values = tokens[:, 0].astype(np.float32)
-        
-        if len(onset_values) == 0:
-            return normalized_tokens
-        
-        # 累積時間を差分に変換（generation.pyと同様の処理）
-        # previous_onset + onset_diff = current_onset
-        # onset_diff = current_onset - previous_onset
-        onset_diff = np.diff(onset_values, prepend=onset_values[0])
-        
-        # 最初のonsetは0からの相対時間とする
-        if onset_values[0] > 0:
-            onset_diff[0] = onset_values[0]
-        
-        # 負の差分を0にする（時間は逆戻りしない）
-        onset_diff = np.maximum(onset_diff, 0)
-        
-        # 語彙サイズ内に収める
-        # 対数スケールでビニング（大きな時間差をより細かく表現）
-        max_onset_diff = onset_diff.max()
-        if max_onset_diff > self.onset_vocab_size - 1:
-            # 対数スケールでビニング
-            onset_diff_log = np.log1p(onset_diff)  # log(1+x)
-            onset_diff_log_max = onset_diff_log.max()
-            if onset_diff_log_max > 0:
-                onset_diff_normalized = (onset_diff_log / onset_diff_log_max * (self.onset_vocab_size - 1))
-                normalized_tokens[:, 0] = onset_diff_normalized.astype(np.int32)
-            else:
-                normalized_tokens[:, 0] = 0
-        else:
-            # すでに範囲内の場合はそのまま使用
-            normalized_tokens[:, 0] = onset_diff.astype(np.int32)
-        
-        print(f"Onset normalization: [{tokens[:, 0].min()}, {tokens[:, 0].max()}] "
-            f"-> [{normalized_tokens[:, 0].min()}, {normalized_tokens[:, 0].max()}]")
-        
-        return normalized_tokens
-    
-    def validate_and_clip_tokens(self, tokens: np.ndarray, skip_onset: bool = False) -> np.ndarray:
-        """
-        トークンの値を検証して語彙サイズ内にクリッピング
-        
-        Args:
-            tokens: [seq_len, 6] shape のトークン配列
-            skip_onset: onset列のクリッピングをスキップするか
-        
-        Returns:
-            clipped_tokens: クリッピング後のトークン配列
-        """
-        vocab_sizes = [
-            self.onset_vocab_size,
-            self.dur_vocab_size,
-            self.octave_vocab_size,
-            self.pitch_class_vocab_size,
-            self.instrument_vocab_size,
-            self.velocity_vocab_size
-        ]
-        
-        feature_names = ["onset", "duration", "octave", "pitch_class", "instrument", "velocity"]
-        
-        clipped_tokens = tokens.copy()
-        
-        for i, (vocab_size, feature_name) in enumerate(zip(vocab_sizes, feature_names)):
-            # onset列はnormalize_onset_tokensで処理するのでスキップ
-            if i == 0 and skip_onset:
-                continue
-                
-            # 各特徴量の最大値・最小値を確認
-            max_val = tokens[:, i].max()
-            min_val = tokens[:, i].min()
-            
-            if max_val >= vocab_size or min_val < 0:
-                print(f"WARNING: {feature_name} values out of range!")
-                print(f"  Range: [{min_val}, {max_val}], Expected: [0, {vocab_size-1}]")
-                
-                # クリッピング
-                clipped_tokens[:, i] = np.clip(tokens[:, i], 0, vocab_size - 1)
-                
-                n_clipped = np.sum((tokens[:, i] < 0) | (tokens[:, i] >= vocab_size))
-                print(f"  Clipped {n_clipped} tokens")
-        
-        return clipped_tokens
-    
-    def npy_to_tokens(self, npy_path: str, max_length: int = 133) -> torch.Tensor:
+    def npy_to_tokens(self, tokens: np.ndarray, max_length: int = 133) -> torch.Tensor:
         """
         npyファイル（前処理済みトークン）を読み込んでテンソルに変換
         
         Args:
-            npy_path: npyファイルのパス
+            tokens: npyファイル
             max_length: 最大シーケンス長
         
         Returns:
             tokens: [1, seq_len, 6] shape のトークンテンソル
         """
-        # npyファイルを読み込み
-        tokens = np.load(npy_path)  # [seq_len, 6]
-        
         print(f"\n=== Loading NPY File ===")
-        print(f"File: {npy_path}")
         print(f"Original shape: {tokens.shape}")
         print(f"Original onset range: [{tokens[:, 0].min()}, {tokens[:, 0].max()}]")
         
@@ -257,21 +161,19 @@ class MusicEmotionClassifier:
         
         return tokens
     
-    def npy_to_tokens_chunked(self, npy_path: str, chunk_length: int = 133, stride: int = 130) -> List[torch.Tensor]:
+    def npy_to_tokens_chunked(self, tokens: np.ndarray, chunk_length: int = 133, stride: int = 130) -> List[torch.Tensor]:
         """
         npyファイルを非オーバーラップでチャンク化
         onset値を相対時間に正規化してから分割
         
         Args:
-            npy_path: npyファイルのパス
+            tokens: npyファイル
             chunk_length: チャンクの最大長
             stride: スライディングウィンドウのストライド（Noneの場合はchunk_lengthと同じ=非オーバーラップ）
         
         Returns:
             chunks: チャンクのリスト
         """
-        tokens = np.load(npy_path)
-        
         if tokens.ndim != 2 or tokens.shape[1] != 6:
             raise ValueError(f"Expected shape [seq_len, 6], got {tokens.shape}")
         
@@ -326,7 +228,7 @@ class MusicEmotionClassifier:
     
     def predict(
         self, 
-        npy_path: str,
+        tokens: np.ndarray,
         return_probabilities: bool = False,
         chunk_length: int = 133
     ) -> Dict:
@@ -341,37 +243,43 @@ class MusicEmotionClassifier:
         Returns:
             result: 予測結果の辞書
         """
-        tokens = np.load(npy_path)
-        
         # シーケンス長をチェック
         if len(tokens) <= chunk_length:
             # 短い場合は従来の方法
-            tokens_tensor = self.npy_to_tokens(npy_path, max_length=chunk_length+1)
+            tokens_tensor = self.npy_to_tokens(tokens, max_length=chunk_length+1)
             tokens_tensor = tokens_tensor.to(self.device)
             with torch.no_grad():
                 outputs = self.model(input_ids=tokens_tensor)
                 logits = outputs.logits
+                realfake_logits = outputs.real_fake_logits
             
             num_chunks = 1
         else:
             # 長い場合はチャンク化して平均
-            chunks = self.npy_to_tokens_chunked(npy_path, chunk_length)
+            chunks = self.npy_to_tokens_chunked(tokens, chunk_length)
             
             all_logits = []
+            all_realfake_logits = []
             for chunk in chunks:
                 chunk = chunk.to(self.device)
                 with torch.no_grad():
                     outputs = self.model(input_ids=chunk)
                     all_logits.append(outputs.logits)
+                    all_realfake_logits.append(outputs.real_fake_logits)
             
             # logitsの平均を取る
             logits = torch.mean(torch.stack(all_logits), dim=0)
+            realfake_logits = torch.mean(torch.stack(all_realfake_logits), dim=0)
             num_chunks = len(chunks)
         
         # 予測クラス
         probabilities = torch.softmax(logits, dim=-1).cpu().numpy()[0]
         predicted_class = int(torch.argmax(logits, dim=-1).cpu().item())
         confidence = float(probabilities[predicted_class])
+        
+        probabilities_realfake = torch.softmax(realfake_logits, dim=-1).cpu().numpy()[0]
+        predicted_class_realfake = int(torch.argmax(realfake_logits, dim=-1).cpu().item())
+        confidence_realfake = float(probabilities_realfake[predicted_class_realfake])
         
         emotion_labels = {
             0: "Happy (Q1)",
@@ -381,11 +289,15 @@ class MusicEmotionClassifier:
         }
         
         predicted_label = emotion_labels.get(predicted_class, f"Class_{predicted_class}")
+        predicted_label_realfake = "Real" if predicted_class_realfake == 1 else "Fake"
         
         result = {
             'predicted_class': predicted_class,
             'predicted_label': predicted_label,
             'confidence': confidence,
+            'predicted_class_realfake': predicted_class_realfake,
+            'predicted_label_realfake': predicted_label_realfake,
+            'confidence_label_realfake': confidence_realfake,
             'num_chunks': num_chunks
         }
         
@@ -397,7 +309,7 @@ class MusicEmotionClassifier:
     
     def predict_batch(
         self, 
-        npy_paths: List[str], 
+        tokens_list: List[np.ndarray], 
         batch_size: int = 8
     ) -> List[Dict]:
         """
@@ -405,17 +317,17 @@ class MusicEmotionClassifier:
         """
         results = []
         
-        for i in range(0, len(npy_paths), batch_size):
-            batch_paths = npy_paths[i:i+batch_size]
+        for i in range(0, len(tokens_list), batch_size):
+            batch_tokens_list = tokens_list[i:i+batch_size]
             
             # バッチトークン化
             batch_tokens = []
-            for path in batch_paths:
+            for tokens in batch_tokens_list:
                 try:
-                    tokens = self.npy_to_tokens(path)
+                    tokens = self.npy_to_tokens(tokens)
                     batch_tokens.append(tokens)
                 except Exception as e:
-                    print(f"Error processing {path}: {e}")
+                    print(f"Error processing {tokens}: {e}")
                     continue
             
             if len(batch_tokens) == 0:
@@ -440,9 +352,9 @@ class MusicEmotionClassifier:
             }
             
             # 結果を格納
-            for j, path in enumerate(batch_paths):
+            for j, tokens in enumerate(batch_tokens_list):
                 result = {
-                    'npy_path': path,
+                    'tokens': tokens,
                     'predicted_class': int(predictions[j]),
                     'predicted_label': emotion_labels.get(int(predictions[j]), f"Class_{predictions[j]}"),
                     'confidence': float(probabilities[j, predictions[j]]),
@@ -459,10 +371,10 @@ def main():
     from pathlib import Path
     
     # 分類器を初期化
-    classifier = MusicEmotionClassifier(
-        pretrained_checkpoint="/mnt/kiso-qnap5/obara/Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_839M.pt",
-        lora_adapter_path="/mnt/kiso-qnap5/obara/Moonbeam-MIDI-Foundation-Model/models/emotion_classification-v3",
-        config_path="/mnt/kiso-qnap5/obara/Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config.json",
+    classifier = ScoreArrangeDomainClassifier(
+        pretrained_checkpoint="/mnt/kiso-qnap5/obara/StarGAN_music/Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_839M.pt",
+        lora_adapter_path="/mnt/kiso-qnap5/obara/StarGAN_music/Moonbeam-MIDI-Foundation-Model/models/emotion_classification-v3",
+        config_path="/mnt/kiso-qnap5/obara/StarGAN_music/Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config.json",
         device="cuda" if torch.cuda.is_available() else "cpu"
     )
     
@@ -472,7 +384,7 @@ def main():
     print("="*60)
     
     # CSVファイルを読み込み
-    csv_path = "/mnt/kiso-qnap5/obara/Moonbeam-MIDI-Foundation-Model/processed_datasets/classification/emopia2.2_1071_clips/train_test_split.csv"
+    csv_path = "/mnt/kiso-qnap5/obara/StarGAN_music/Moonbeam-MIDI-Foundation-Model/processed_datasets/classification/emopia2.2_1071_clips/train_test_split.csv"
     df = pd.read_csv(csv_path)
     
     # testデータのみを抽出
@@ -483,7 +395,7 @@ def main():
     print(test_df['label'].value_counts().sort_index())
     
     # npyファイルのベースパス
-    base_path = Path("/mnt/kiso-qnap5/obara/Moonbeam-MIDI-Foundation-Model/processed_datasets/classification/emopia2.2_1071_clips/processed")
+    base_path = Path("/mnt/kiso-qnap5/obara/StarGAN_music/Moonbeam-MIDI-Foundation-Model/processed_datasets/classification/emopia2.2_1071_clips/processed")
     
     # 推論結果を格納
     predictions = []
@@ -499,6 +411,7 @@ def main():
         file_name = row['file_base_name']
         true_label = row['label']
         npy_path = base_path / file_name
+        tokens = np.load(npy_path)  
         
         # ファイルの存在確認
         if not npy_path.exists():
@@ -507,7 +420,7 @@ def main():
             continue
         
         try:
-            result = classifier.predict(str(npy_path), return_probabilities=False)
+            result = classifier.predict(tokens, return_probabilities=False)
             predicted_class = result['predicted_class']
             num_chunks = result.get('num_chunks', 1)
 

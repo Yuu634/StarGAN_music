@@ -2,10 +2,11 @@
 # run_all.sh
 
 BASE_DATASET="lmd_full"
-NUM_FEATURES=5
+NUM_FEATURES=8
 ENCODING="nb"
+VOCAB_PATH="../models/Amadeus-S/files/checkpoints/vocab_LakhALLFined_nb8.json"
 OUT_DIR="../dataset/MidiCaps/corpus/"
-SUBDIRS=("2" "3" "4" "5" "6" "7" "8" "9" "a" "b" "c" "d" "e" "f")
+SUBDIRS=("0" "1" "2" "3" "4" "5" "6" "7" "8" "9" "a" "b" "c" "d" "e" "f")
 
 for SUBDIR in "${SUBDIRS[@]}"; do
     DATASET="${BASE_DATASET}/${SUBDIR}"
@@ -28,5 +29,5 @@ for SUBDIR in "${SUBDIRS[@]}"; do
 
     IN_DIR="${OUT_DIR}"
     echo "Running step4 with dataset=$DATASET"
-    python3 step4_event2tuneidx.py --dataset "$DATASET" --num_features "$NUM_FEATURES" --encoding "$ENCODING" --in_dir "$IN_DIR" --out_dir "$OUT_DIR" --is_hierarchical True
+    python3 step4_event2tuneidx.py --dataset "$DATASET" --num_features "$NUM_FEATURES" --encoding "$ENCODING" --vocab_path "$VOCAB_PATH" --in_dir "$IN_DIR" --out_dir "$OUT_DIR" --is_hierarchical True
 done

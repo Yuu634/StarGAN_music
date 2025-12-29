@@ -23,7 +23,7 @@ def main(config):
         os.makedirs(config.result_dir)
 
     # Data loader.
-    score_loader = get_loader(config.score_dir, config.attr_path, config.selected_attrs,
+    score_loader = get_loader(config.score_dir, config.encoding, config.attr_path, config.selected_attrs,
                               config.batch_size,'MidiCaps', config.mode, config.num_workers)
     
 
@@ -70,7 +70,7 @@ if __name__ == '__main__':
     parser.add_argument('--d_modelpath', type=str, default="../Moonbeam-MIDI-Foundation-Model/models/emotion_classification-v1", help='path to the discriminator model')
     
     # Training configuration.
-    parser.add_argument('--dataset', type=str, default='CelebA', choices=['CelebA', 'RaFD', 'Both'])
+    parser.add_argument('--dataset', type=str, default='MidiCaps', choices=['MidiCaps', 'Both'])
     parser.add_argument('--batch_size', type=int, default=1, help='mini-batch size')
     parser.add_argument('--num_iters', type=int, default=200000, help='number of total iterations for training D')
     parser.add_argument('--num_iters_decay', type=int, default=100000, help='number of iterations for decaying lr')
@@ -92,12 +92,15 @@ if __name__ == '__main__':
     parser.add_argument('--use_tensorboard', type=str2bool, default=True)
 
     # Directories.
-    parser.add_argument('--score_dir', type=str, default='../Amadeus/dataset/MidiCaps/tuneidx_')
+    parser.add_argument('--score_dir', type=str, default='../Amadeus/dataset/MidiCaps/corpus/tuneidx_')
+    parser.add_argument('--encoding', type=str, default='nb8')  
     parser.add_argument('--attr_path', type=str, default='../Dataset/MidiCaps/train.json')
-    parser.add_argument('--log_dir', type=str, default='stargan/logs')
-    parser.add_argument('--model_save_dir', type=str, default='stargan/models')
-    parser.add_argument('--sample_dir', type=str, default='stargan/samples')
-    parser.add_argument('--result_dir', type=str, default='stargan/results')
+    parser.add_argument('--vocab_path', type=str, default='../Amadeus/models/Amadeus-S/files/checkpoints/vocab_LakhALLFined_nb8.json')
+    model_name = "MidiCaps-v0"
+    parser.add_argument('--log_dir', type=str, default=f'result/{model_name}/logs')
+    parser.add_argument('--model_save_dir', type=str, default=f'result/{model_name}/models')
+    parser.add_argument('--sample_dir', type=str, default=f'result/{model_name}/samples')
+    parser.add_argument('--result_dir', type=str, default=f'result/{model_name}/results')
 
     # Step size.
     parser.add_argument('--log_step', type=int, default=10)

@@ -5,7 +5,7 @@ torchrun --nnodes 1 --nproc_per_node 1 recipes/finetuning/real_finetuning_player
   --run_validation True \
   --validation_interval 399 \
   --save_metrics True \
-  --dist_checkpoint_root_folder "models/emotion_classification-v2/checkpoints" \
+  --dist_checkpoint_root_folder "models/emotion_classification-test/checkpoints" \
   --dist_checkpoint_folder ddp \
   --trained_checkpoint_path "models/pretrained/moonbeam_839M.pt" \
   --pure_bf16 True \
@@ -15,10 +15,10 @@ torchrun --nnodes 1 --nproc_per_node 1 recipes/finetuning/real_finetuning_player
   --quantization False \
   --model_name "Emotion-classify" \
   --dataset "player_classification_dataset" \
-  --output_dir "models/emotion_classification-v2" \
+  --output_dir "models/emotion_classification-test" \
   --batch_size_training 5 \
   --context_length 133 \
-  --num_epochs 300 \
+  --num_epochs 5 \
   --use_wandb True \
   --use_cache False \
   --individual_eval True

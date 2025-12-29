@@ -45,6 +45,19 @@ class AmadeusModelWrapper(nn.Module):
     self._get_sub_decoder(sub_decoder_name, prediction_order, vocab, sub_decoder_depth, sub_decoder_enricher_use, dim, heads, dropout)
     self.bos_token_hidden = None
  
+  def _merge_input_note(self, input_seq:torch.Tensor, input_note:torch.Tensor) -> torch.Tensor:
+    if input_note.dim() == 2:
+      input_note = input_note.unsqueeze(0)
+    if input_note.size(-1) != input_seq.size(-1):
+      raise ValueError("input_note must match feature dimension of input_seq")
+    note_seq = input_note[:, -self.input_length:]
+    if note_seq.size(1) < self.input_length:
+      pad_len = self.input_length - note_seq.size(1)
+      pad = note_seq.new_zeros(note_seq.size(0), pad_len, note_seq.size(2))
+      note_seq = torch.cat([pad, note_seq], dim=1)
+    concatenated = torch.cat([input_seq, note_seq], dim=1)
+    return concatenated[:, -self.input_length:]
+
   def _get_input_embedder(self, input_embedder_name, vocab, dropout, dim):
     self.emb_dropout = nn.Dropout(dropout)
     self.input_embedder = getattr(transformer_utils, input_embedder_name)(
@@ -77,7 +90,9 @@ class AmadeusModelWrapper(nn.Module):
   def device(self):
     return next(self.parameters()).device
 
-  def forward(self, input_seq:torch.Tensor, target:torch.Tensor, context=None):
+  def forward(self, input_seq:torch.Tensor, target:torch.Tensor, context=None, input_note:torch.Tensor=None):
+    if input_note is not None:
+      input_seq = self._merge_input_note(input_seq, input_note)
     embedding = self.input_embedder(input_seq) + self.pos_enc(input_seq)
     embedding = self.emb_dropout(embedding)
     hidden_vec,layer_inter = self.main_decoder(embedding,train=True, context=context)  # B x T x d_model
@@ -103,8 +118,8 @@ class AmadeusModelAutoregressiveWrapper(nn.Module):
     super().__init__()
     self.net = net
 
-  def forward(self, input_seq:torch.Tensor, target:torch.Tensor,context=None): 
-    return self.net(input_seq, target, context=context)
+  def forward(self, input_seq:torch.Tensor, target:torch.Tensor,context=None, input_note:torch.Tensor=None): 
+    return self.net(input_seq, target, context=context, input_note=input_note)
   
   def _prepare_inference(self, start_token, manual_seed, condition=None, num_target_measures=4):
     '''
@@ -246,7 +261,7 @@ class AmadeusModelAutoregressiveWrapper(nn.Module):
     total_out = self._prepare_inference(self.net.start_token, manual_seed, condition, num_target_measures)
 
     # === NEW: Process input_note if provided ===
-    generation_step = 1
+    generation_step = 0
 
     # If a condition is provided, run one initial step
     if condition is not None:
@@ -443,8 +458,8 @@ class AmadeusModel(nn.Module):
       net=decoder
     )
   
-  def forward(self, input_seq:torch.Tensor, target:torch.Tensor, context=None):
-    return self.decoder(input_seq, target, context=context)
+  def forward(self, input_seq:torch.Tensor, target:torch.Tensor, context=None, input_note:torch.Tensor=None):
+    return self.decoder(input_seq, target, context=context, input_note=input_note)
   
   @torch.inference_mode()
   def generate(self, manual_seed, max_seq_len, condition=None, num_target_measures=4, sampling_method=None, threshold=None, temperature=1,batch_size=1,context=None, input_note=None):

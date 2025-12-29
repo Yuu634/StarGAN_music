@@ -1,29 +1,27 @@
-from model import Generator
-from model import Discriminator
-from torch.autograd import Variable
-from torchvision.utils import save_image
+import datetime
+import os
+import re
+import sys
+import time
+from typing import List, Optional, Tuple
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-import os
-import time
-import datetime
-import re
-from Amadeus.Amadeus import model_zoo
-from transformers import T5Tokenizer, T5EncoderModel
-import sys
-sys.path.append("Moonbeam-MIDI-Foundation-Model")
-from inference import ScoreArrangeDomainClassifier
+from transformers import T5EncoderModel, T5Tokenizer
+import torch.nn as nn
+import json
+
+sys.path.append("../Moonbeam-MIDI-Foundation-Model")
+from inference import ScoreArrangeDomainClassifier  # type: ignore
 sys.path.append("../Amadeus")
-from generate import load_resources
+from generate import load_resources  # type: ignore
+AMAEDEUS_FIELDS = ["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"]
 
 class Solver(object):
-    """Solver for training and testing StarGAN."""
+    """Solver for training and testing the symbolic StarGAN."""
 
     def __init__(self, score_loader, config):
-        """Initialize configurations."""
-
-        # Data loader.
         self.score_loader = score_loader
 
         # Model configurations.
@@ -38,15 +36,16 @@ class Solver(object):
         self.lambda_rec = config.lambda_rec
         self.lambda_gp = config.lambda_gp
         
-        # Generator configurations.
+        # Generator / discriminator specific configs.
         self.g_modelpath = config.g_modelpath
         self.generate_length = config.generate_length
         self.sampling_method = config.sampling_method
         self.threshold = config.threshold
         self.temperature = config.temperature
-        
-        # Discriminator configurations.
         self.d_modelpath = config.d_modelpath
+        self.text_encoder_model = getattr(config, "text_encoder_model", "google/flan-t5-large")
+        self.text_max_length = getattr(config, "text_max_length", 128)
+        self.moonbeam_max_length = getattr(config, "moonbeam_max_length", 134)
 
         # Training configurations.
         self.dataset = config.dataset
@@ -59,16 +58,22 @@ class Solver(object):
         self.beta1 = config.beta1
         self.beta2 = config.beta2
         self.resume_iters = config.resume_iters
-        self.selected_attrs = config.selected_attrs
+        self.selected_attrs = config.selected_attrs or ["arrangement"]
 
         # Test configurations.
         self.test_iters = config.test_iters
 
         # Miscellaneous.
         self.use_tensorboard = config.use_tensorboard
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # text-to-score embedding.
+        self.context_proj = nn.Linear(
+            1024, 768, bias=False
+        ).to(self.device)
+        
         # Directories.
+        self.vocab_path = config.vocab_path
         self.log_dir = config.log_dir
         self.sample_dir = config.sample_dir
         self.model_save_dir = config.model_save_dir
@@ -80,124 +85,385 @@ class Solver(object):
         self.model_save_step = config.model_save_step
         self.lr_update_step = config.lr_update_step
 
-        # Build the model and tensorboard.
+        self.tokenizer = None
+        self.text_encoder = None
+
         self.build_model()
         if self.use_tensorboard:
             self.build_tensorboard()
 
     def build_model(self):
-        """Create a generator and a discriminator."""
-        if self.dataset in ['MidiCaps']:
-            """self.G = Generator(self.g_conv_dim, self.c_dim, self.g_repeat_num)"""
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            config, self.G, vocab = load_resources(self.g_modelpath, device)
-            
-            """self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim, self.d_repeat_num)"""
-            self.D = ScoreArrangeDomainClassifier(
-                pretrained_checkpoint="../Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_839M.pt",
-                lora_adapter_path=self.d_modelpath,
-                config_path="../Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config.json",
-                device="cuda" if torch.cuda.is_available() else "cpu"
-                selected_attr = self.selected_attrs
-            )
-        elif self.dataset in ['Both']:
-            """self.G = Generator(self.g_conv_dim, self.c_dim+self.c2_dim+2, self.g_repeat_num)   # 2 for mask vector."""
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            config, self.G, vocab = load_resources(self.g_modelpath, device)
-            
-            """self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim+self.c2_dim, self.d_repeat_num)"""
-            self.D = ScoreArrangeDomainClassifier(
-                pretrained_checkpoint="../Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_839M.pt",
-                lora_adapter_path=self.d_modelpath,
-                config_path="../Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config.json",
-                device="cuda" if torch.cuda.is_available() else "cpu"
-            )
+        device = self.device
+        _, self.G, _ = load_resources(self.g_modelpath, device)
+        self.G.to(device)
+        self.G.train()
+
+        self.moonbeam = ScoreArrangeDomainClassifier(
+            pretrained_checkpoint="../Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_839M.pt",
+            lora_adapter_path=self.d_modelpath,
+            config_path="../Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config.json",
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            selected_attr=self.selected_attrs,
+        )
+        self.D = self.moonbeam.model
+        self.D.to(device)
+        self.D.train()
+        self.classification_token = torch.tensor(self.moonbeam.classification_token, device=device)
+        self.pad_token = torch.tensor(self.moonbeam.pad_token, device=device)
 
         self.g_optimizer = torch.optim.Adam(self.G.parameters(), self.g_lr, [self.beta1, self.beta2])
         self.d_optimizer = torch.optim.Adam(self.D.parameters(), self.d_lr, [self.beta1, self.beta2])
-        self.print_network(self.G, 'G')
-        self.print_network(self.D, 'D')
-            
-        self.G.to(self.device)
-        self.D.to(self.device)
+
+        self._init_text_encoder()
+        self.print_network(self.G, "G")
+        self.print_network(self.D, "D")
+
+    def _init_text_encoder(self):
+        self.tokenizer = T5Tokenizer.from_pretrained(self.text_encoder_model)
+        self.text_encoder = T5EncoderModel.from_pretrained(self.text_encoder_model).to(self.device)
+        self.text_encoder.eval()
+        for param in self.text_encoder.parameters():
+            param.requires_grad = False
 
     def print_network(self, model, name):
-        """Print out the network information."""
-        num_params = 0
-        for p in model.parameters():
-            num_params += p.numel()
+        num_params = sum(p.numel() for p in model.parameters())
         print(model)
         print(name)
-        print("The number of parameters: {}".format(num_params))
+        print(f"The number of parameters: {num_params}")
 
     def restore_model(self, resume_iters):
-        """Restore the trained generator and discriminator."""
-        print('Loading the trained models from step {}...'.format(resume_iters))
-        G_path = os.path.join(self.model_save_dir, '{}-G.ckpt'.format(resume_iters))
-        D_path = os.path.join(self.model_save_dir, '{}-D.ckpt'.format(resume_iters))
-        self.G.load_state_dict(torch.load(G_path, map_location=lambda storage, loc: storage))
-        self.D.load_state_dict(torch.load(D_path, map_location=lambda storage, loc: storage))
+        print(f"Loading the trained models from step {resume_iters}...")
+        G_path = os.path.join(self.model_save_dir, f"{resume_iters}-G.ckpt")
+        D_path = os.path.join(self.model_save_dir, f"{resume_iters}-D.ckpt")
+        self.G.load_state_dict(torch.load(G_path, map_location=self.device))
+        self.D.load_state_dict(torch.load(D_path, map_location=self.device))
 
     def build_tensorboard(self):
-        """Build a tensorboard logger."""
         from logger import Logger
+
         self.logger = Logger(self.log_dir)
 
     def update_lr(self, g_lr, d_lr):
-        """Decay learning rates of the generator and discriminator."""
         for param_group in self.g_optimizer.param_groups:
-            param_group['lr'] = g_lr
+            param_group["lr"] = g_lr
         for param_group in self.d_optimizer.param_groups:
-            param_group['lr'] = d_lr
+            param_group["lr"] = d_lr
 
     def reset_grad(self):
-        """Reset the gradient buffers."""
         self.g_optimizer.zero_grad()
         self.d_optimizer.zero_grad()
 
-    def denorm(self, x):
-        """Convert the range from [-1, 1] to [0, 1]."""
-        out = (x + 1) / 2
-        return out.clamp_(0, 1)
+    def _to_tensor(self, scores):
+        if isinstance(scores, torch.Tensor):
+            tensor = scores
+        else:
+            tensor = torch.tensor(scores)
+        if tensor.dim() == 2:
+            tensor = tensor.unsqueeze(0)
+        return tensor.to(self.device)
 
-    def gradient_penalty(self, y, x):
-        """Compute gradient penalty: (L2_norm(dy/dx) - 1)**2."""
-        weight = torch.ones(y.size()).to(self.device)
-        dydx = torch.autograd.grad(outputs=y,
-                                   inputs=x,
-                                   grad_outputs=weight,
-                                   retain_graph=True,
-                                   create_graph=True,
-                                   only_inputs=True)[0]
+    def _prepare_label_tensor(self, labels):
+        if isinstance(labels, torch.Tensor):
+            tensor = labels.float()
+        else:
+            tensor = torch.tensor(labels, dtype=torch.float32)
+        if tensor.dim() == 1:
+            tensor = tensor.unsqueeze(0)
+        return tensor.to(self.device)
 
-        dydx = dydx.view(dydx.size(0), -1)
-        dydx_l2norm = torch.sqrt(torch.sum(dydx**2, dim=1))
-        return torch.mean((dydx_l2norm-1)**2)
+    def _select_target_attributes(self, labels: torch.Tensor) -> Tuple[torch.Tensor, List[int]]:
+        label_trg = labels.clone()
+        flipped = []
+        for row in label_trg:
+            false_idx = (row < 0.5).nonzero(as_tuple=False)
+            if false_idx.numel() == 0:
+                idx = torch.randint(row.numel(), (1,), device=row.device).item()
+            else:
+                rand = torch.randint(false_idx.size(0), (1,), device=row.device).item()
+                idx = int(false_idx[rand])
+            row[idx] = 1.0
+            flipped.append(idx)
+        return label_trg, flipped
 
-    def label2onehot(self, labels, dim):
-        """Convert label indices to one-hot vectors."""
-        batch_size = labels.size(0)
-        out = torch.zeros(batch_size, dim)
-        out[np.arange(batch_size), labels.long()] = 1
-        return out
+    def _select_origin_attributes(self, labels: torch.Tensor) -> List[int]:
+        indices = []
+        for row in labels:
+            positives = (row > 0.5).nonzero(as_tuple=False)
+            if positives.numel() == 0:
+                indices.append(0)
+            else:
+                indices.append(int(positives[0]))
+        return indices
 
-    def create_labels(self, c_org, c_dim=5, dataset='CelebA', selected_attrs=None):
-        """Generate target domain labels for debugging and testing."""
-        c_dim = len(c_org)
-        c_trg_list = []
-        for i in range(c_dim):
-            c_trg = self.label2onehot(torch.ones(c_org.size(0))*i, c_dim)
-            c_trg_list.append(c_trg.to(self.device))
-        return c_trg_list
+    def _encode_prompts(self, attr_indices: List[int]) -> torch.Tensor:
+        if not attr_indices:
+            return torch.empty(0, self.text_max_length, self.text_encoder.config.d_model, device=self.device)
+        prompts = [self.selected_attrs[idx % len(self.selected_attrs)] for idx in attr_indices]
+        tokenized = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=self.text_max_length,
+        )
+        tokenized = {k: v.to(self.device) for k, v in tokenized.items()}
+        with torch.no_grad():
+            encoded = self.text_encoder(**tokenized).last_hidden_state
+        return self.context_proj(encoded)
 
-    def classification_loss(self, logit, target, dataset='CelebA'):
-        """Compute binary or softmax cross entropy loss."""
-        if dataset == 'CelebA':
-            return F.binary_cross_entropy_with_logits(logit, target, size_average=False) / logit.size(0)
-        elif dataset == 'RaFD':
+    def _run_generator_round(
+        self,
+        x_real: torch.Tensor,
+        target_context: torch.Tensor,
+        origin_context: Optional[torch.Tensor] = None,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        batch_size = x_real.size(0)
+        real_sequences: List[torch.Tensor] = []
+        fake_sequences: List[torch.Tensor] = []
+        recon_sequences: List[torch.Tensor] = []
+        for idx in range(batch_size):
+            seq = x_real[idx].long()
+            length = min(self.generate_length, seq.size(0))
+            seq = seq[:length]
+            real_sequences.append(seq)
+            context_slice = target_context[idx : idx + 1] if target_context.size(0) > 0 else None
+            fake = self.G.generate(
+                manual_seed=0,
+                max_seq_len=length,
+                sampling_method=self.sampling_method,
+                threshold=self.threshold,
+                temperature=self.temperature,
+                context=context_slice,
+                input_note=seq,
+            ).squeeze(0)
+            fake_sequences.append(fake)
+            if origin_context is not None and origin_context.size(0) > 0:
+                origin_slice = origin_context[idx : idx + 1]
+                recon = self.G.generate(
+                    manual_seed=0,
+                    max_seq_len=length,
+                    sampling_method=self.sampling_method,
+                    threshold=self.threshold,
+                    temperature=self.temperature,
+                    context=origin_slice,
+                    input_note=fake,
+                ).squeeze(0)
+                recon_sequences.append(recon)
+        return real_sequences, fake_sequences, recon_sequences
+
+    def _pad_sequence(self, seq: torch.Tensor, target_len: int) -> torch.Tensor:
+        if seq.size(0) >= target_len:
+            return seq[:target_len]
+        pad_len = target_len - seq.size(0)
+        pad = torch.zeros(pad_len, seq.size(1), device=seq.device, dtype=seq.dtype)
+        return torch.cat([seq, pad], dim=0)
+
+    def _stack_and_pad(self, sequences: List[torch.Tensor]) -> torch.Tensor:
+        max_len = max(seq.size(0) for seq in sequences)
+        padded = [self._pad_sequence(seq, max_len) for seq in sequences]
+        return torch.stack(padded, dim=0)
+
+    def _pad_moonbeam_sequence(self, seq: torch.Tensor) -> torch.Tensor:
+        if isinstance(seq, np.ndarray):
+            seq = torch.from_numpy(seq)
+        seq = seq.long().to(self.device)
+        cls_row = torch.zeros(1, seq.size(1), device=self.device, dtype=seq.dtype)
+        cls_row[0, 0] = self.classification_token
+        seq = torch.cat([seq, cls_row], dim=0)
+        max_len = self.moonbeam_max_length
+        if seq.size(0) < max_len:
+            pad_len = max_len - seq.size(0)
+            pad = torch.zeros(pad_len, seq.size(1), device=self.device, dtype=seq.dtype)
+            pad[:, 0] = self.pad_token
+            seq = torch.cat([seq, pad], dim=0)
+        else:
+            seq = torch.cat([seq[: max_len - 1], cls_row], dim=0)
+        return seq
+
+    def _prepare_discriminator_batch(self, sequences: List[torch.Tensor]) -> torch.Tensor:
+        #padded = [self._pad_moonbeam_sequence(self.amadeus_to_moonbeam(seq)) for seq in sequences]
+        sequences_moonbeam = []
+        for seq in sequences:
+            vocabs = self.amadeus_to_vocab(seq, self.vocab_path)
+            seq_moonbeam = self.vocab_to_moonbeam(vocabs)
+            seq_moonbeam = torch.as_tensor(seq_moonbeam)#.reshape(-1)
+            sequences_moonbeam.append(seq_moonbeam)
+        sequences_moonbeam = torch.stack(sequences_moonbeam, dim=0)
+        return sequences_moonbeam #torch.stack(cls_rows, dim=0)
+
+    def _update_discriminator(
+        self,
+        real_sequences: List[torch.Tensor],
+        fake_sequences: List[torch.Tensor],
+        label_org: torch.Tensor,
+    ) -> Tuple[torch.Tensor, dict]:
+        moonbeam_real = self._prepare_discriminator_batch(real_sequences)
+        moonbeam_fake = self._prepare_discriminator_batch(fake_sequences)
+        moonbeam_real = moonbeam_real.to(self.device)
+        moonbeam_fake = moonbeam_fake.to(self.device)
+        outputs_real = self.D(input_ids=moonbeam_real)
+        outputs_fake = self.D(input_ids=moonbeam_fake)
+        out_src_real = outputs_real.real_fake_logits[:, 1]
+        out_src_fake = outputs_fake.real_fake_logits[:, 1]
+        d_loss_real = -torch.mean(out_src_real)
+        d_loss_fake = torch.mean(out_src_fake)
+        d_loss_cls = self.classification_loss(outputs_real.logits, label_org, "MidiCaps")
+        d_loss_gp = torch.tensor(0.0, device=self.device)
+        d_loss = d_loss_real + d_loss_fake + self.lambda_cls * d_loss_cls + self.lambda_gp * d_loss_gp
+        self.reset_grad()
+        d_loss.backward()
+        self.d_optimizer.step()
+        metrics = {
+            "D/loss_real": d_loss_real.item(),
+            "D/loss_fake": d_loss_fake.item(),
+            "D/loss_cls": d_loss_cls.item(),
+            "D/loss_gp": d_loss_gp.item(),
+        }
+        return d_loss, metrics
+
+    def _update_generator(
+        self,
+        fake_sequences: List[torch.Tensor],
+        label_trg: torch.Tensor,
+        real_sequences: List[torch.Tensor],
+        recon_sequences: List[torch.Tensor],
+    ) -> dict:
+        moonbeam_fake = self._prepare_discriminator_batch(fake_sequences)
+        outputs_fake = self.D(input_ids=moonbeam_fake)
+        out_src_fake = outputs_fake.real_fake_logits[:, 1]
+        g_loss_fake = -torch.mean(out_src_fake)
+        g_loss_cls = self.classification_loss(outputs_fake.logits, label_trg, "MidiCaps")
+        if recon_sequences:
+            real_stack = self._stack_and_pad(real_sequences)
+            recon_stack = self._stack_and_pad(recon_sequences)
+            g_loss_rec = torch.mean(torch.abs(real_stack.float() - recon_stack.float()))
+        else:
+            g_loss_rec = torch.tensor(0.0, device=self.device)
+        g_loss = g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_cls * g_loss_cls
+        self.reset_grad()
+        g_loss.backward()
+        self.g_optimizer.step()
+        return {
+            "G/loss_fake": g_loss_fake.item(),
+            "G/loss_rec": g_loss_rec.item(),
+            "G/loss_cls": g_loss_cls.item(),
+        }
+
+    def train(self):
+        data_loader = self.score_loader
+        data_iter = iter(data_loader)
+        g_lr = self.g_lr
+        d_lr = self.d_lr
+        start_iters = 0
+        if self.resume_iters:
+            start_iters = self.resume_iters
+            self.restore_model(self.resume_iters)
+
+        print("Start training...")
+        start_time = time.time()
+        for i in range(start_iters, self.num_iters):
+            try:
+                x_real, label_org = next(data_iter)
+            except (StopIteration, FileNotFoundError):
+                continue
+                #data_iter = iter(data_loader)
+                #x_real, label_org = next(data_iter)
+
+            x_real = self._to_tensor(x_real)
+            label_org = self._prepare_label_tensor(label_org)
+            label_trg, flipped_indices = self._select_target_attributes(label_org)
+            origin_indices = self._select_origin_attributes(label_org)
+            target_context = self._encode_prompts(flipped_indices)
+            origin_context = self._encode_prompts(origin_indices)
+
+            real_sequences, fake_sequences, recon_sequences = self._run_generator_round(
+                x_real, target_context, origin_context
+            )
+
+            _, loss = self._update_discriminator(real_sequences, fake_sequences, label_org)
+
+            if (i + 1) % self.n_critic == 0:
+                g_loss_metrics = self._update_generator(
+                    fake_sequences, label_trg, real_sequences, recon_sequences
+                )
+                loss.update(g_loss_metrics)
+
+            if (i + 1) % self.log_step == 0:
+                elapsed = str(datetime.timedelta(seconds=time.time() - start_time))[:-7]
+                log = f"Elapsed [{elapsed}], Iteration [{i + 1}/{self.num_iters}]"
+                for tag, value in loss.items():
+                    log += f", {tag}: {value:.4f}"
+                print(log)
+                if self.use_tensorboard:
+                    for tag, value in loss.items():
+                        self.logger.scalar_summary(tag, value, i + 1)
+
+            if (i + 1) % self.model_save_step == 0:
+                G_path = os.path.join(self.model_save_dir, f"{i + 1}-G.ckpt")
+                D_path = os.path.join(self.model_save_dir, f"{i + 1}-D.ckpt")
+                torch.save(self.G.state_dict(), G_path)
+                torch.save(self.D.state_dict(), D_path)
+                print(f"Saved model checkpoints into {self.model_save_dir}...")
+
+            if (i + 1) % self.lr_update_step == 0 and (i + 1) > (self.num_iters - self.num_iters_decay):
+                g_lr -= self.g_lr / float(self.num_iters_decay)
+                d_lr -= self.d_lr / float(self.num_iters_decay)
+                self.update_lr(g_lr, d_lr)
+                print(f"Decayed learning rates, g_lr: {g_lr}, d_lr: {d_lr}.")
+
+    def train_multi(self):
+        raise NotImplementedError("Multi-dataset training is not supported in the symbolic pipeline.")
+
+    def test(self):
+        self.restore_model(self.test_iters)
+        self.G.eval()
+        data_loader = self.score_loader
+        os.makedirs(self.result_dir, exist_ok=True)
+        with torch.no_grad():
+            for idx, (x_real, label_org) in enumerate(data_loader, start=1):
+                x_real = self._to_tensor(x_real)
+                label_org = self._prepare_label_tensor(label_org)
+                label_trg, flipped_indices = self._select_target_attributes(label_org)
+                target_context = self._encode_prompts(flipped_indices)
+                _, fake_sequences, _ = self._run_generator_round(x_real, target_context, None)
+                for b, seq in enumerate(fake_sequences):
+                    save_path = os.path.join(self.result_dir, f"sample_{idx:05d}_{b}.npz")
+                    np.savez(save_path, seq.cpu().numpy())
+                    print(f"Saved translated score to {save_path}")
+        self.G.train()
+
+    def test_multi(self):
+        raise NotImplementedError("Multi-dataset testing is not supported in the symbolic pipeline.")
+
+    def classification_loss(self, logit, target, dataset="CelebA"):
+        if dataset in ("CelebA", "MidiCaps"):
+            return F.binary_cross_entropy_with_logits(logit, target, reduction="mean")
+        if dataset == "RaFD":
             return F.cross_entropy(logit, target)
+        raise ValueError(f"Unsupported dataset: {dataset}")
+    
+    def _build_lookup_table(self, field_dict: dict[str, str]) -> np.ndarray:
+        max_idx = max(int(k) for k in field_dict.keys())
+        table = ["" for _ in range(max_idx + 1)]
+        for k, v in field_dict.items():
+            table[int(k)] = v
+        return np.array(table, dtype=object)
 
-    def amadeus_to_moonbeam(self, amadeus_tokens, time_resolution=10, default_tempo=120, in_beat_resolution=4):
+    def amadeus_to_vocab(self, amadeus_tokens: torch.Tensor, vocab_path: str) -> np.ndarray:
+        """Amadeusのトークン列を語彙に変換し、amadeus_to_moonbeam利用可能な形式に"""
+        with open(vocab_path, "r", encoding="utf-8") as f:
+            vocab = json.load(f)
+
+        tokens_np = amadeus_tokens.detach().cpu().numpy().astype(np.int64)
+        decoded = np.empty(tokens_np.shape, dtype=object)
+
+        for axis, field in enumerate(AMAEDEUS_FIELDS):
+            lookup = self._build_lookup_table(vocab[field])
+            decoded[:, axis] = lookup[tokens_np[:, axis]]
+
+        return decoded
+    
+    def vocab_to_moonbeam(self, amadeus_vocabs, time_resolution=10, default_tempo=120, in_beat_resolution=4):
         # (Beat + 小節数) * Tempo → onset(ms)
         # duration * Tempo → duration(ms)
         # pitch → octave*12 + pitch_class
@@ -226,14 +492,14 @@ class Solver(object):
         """
         
         # Convert to numpy for easier processing
-        if isinstance(amadeus_tokens, torch.Tensor):
-            amadeus_np = amadeus_tokens.cpu().numpy()
+        if isinstance(amadeus_vocabs, torch.Tensor):
+            amadeus_np = amadeus_vocabs.cpu().numpy()
             use_torch = True
-        elif isinstance(amadeus_tokens, list):
-            amadeus_np = np.array(amadeus_tokens)
+        elif isinstance(amadeus_vocabs, list):
+            amadeus_np = np.array(amadeus_vocabs)
             use_torch = False
         else:
-            amadeus_np = np.array(amadeus_tokens)
+            amadeus_np = np.array(amadeus_vocabs)
             use_torch = False
         
         # Check shape and transpose if needed
@@ -248,7 +514,11 @@ class Solver(object):
         current_tempo = default_tempo
         current_time_signature = (4, 4)  # (numerator, denominator)
         
-        for i in range(num_notes):
+        # First note
+        for k in range(6):
+            moonbeam_np[0, k] = 0
+        
+        for i in range(1, num_notes):
             type_token = amadeus_np[i, 0]
             beat_token = amadeus_np[i, 1]
             chord_token = amadeus_np[i, 2]
@@ -365,451 +635,3 @@ class Solver(object):
             moonbeam_tokens = moonbeam_np
         
         return moonbeam_tokens
-
-    
-    def train(self):
-        """Train StarGAN within a single dataset."""
-        # Set data loader.
-        data_loader = self.score_loader
-
-        # Fetch fixed inputs for debugging.
-        data_iter = iter(data_loader)
-        x_fixed, c_org = next(data_iter)
-        x_fixed = x_fixed.to(self.device)
-        c_fixed_list = self.create_labels(c_org, self.c_dim, self.dataset, self.selected_attrs)
-
-        # Learning rate cache for decaying.
-        g_lr = self.g_lr
-        d_lr = self.d_lr
-
-        # Start training from scratch or resume training.
-        start_iters = 0
-        if self.resume_iters:
-            start_iters = self.resume_iters
-            self.restore_model(self.resume_iters)
-
-        # Start training.
-        print('Start training...')
-        start_time = time.time()
-        for i in range(start_iters, self.num_iters):
-
-            # =================================================================================== #
-            #                             1. Preprocess input data                                #
-            # =================================================================================== #
-
-            # Fetch real images and labels.
-            try:
-                x_real, label_org = next(data_iter)
-            except:
-                data_iter = iter(data_loader)
-                x_real, label_org = next(data_iter)
-            label_org = label_org.squeeze(0)
-            
-            # Generate target domain labels randomly.
-            label_trg = label_org.clone()
-            false_indices = (label_org == False).nonzero(as_tuple=True)[0]
-            
-            if len(false_indices) > 0:
-                # ランダムにFalseの1つをTrueに変更
-                random_false_idx = false_indices[torch.randint(len(false_indices), (1,)).item()]
-                label_trg[random_false_idx] = True
-
-            c_org = label_org.clone()
-            c_trg = label_trg.clone()
-
-            x_real = x_real.to(self.device)           # Input images.
-            c_org = c_org.to(self.device)             # Original domain labels.
-            c_trg = c_trg.to(self.device)             # Target domain labels.
-            label_org = label_org.to(self.device)     # Labels for computing classification loss.
-            label_trg = label_trg.to(self.device)     # Labels for computing classification loss.
-
-            # =================================================================================== #
-            #                             2. Train the discriminator                              #
-            # =================================================================================== #
-
-            # Compute loss with real images.
-            """out_src, out_cls = self.D(x_real)"""
-            x_real_D = self.amadeus_to_moonbeam(x_real)
-            result = self.D.predict(x_real_D, return_probabilities=False)
-            out_src, out_cls = result['predicted_class_realfake'], result['predicted_class']
-            
-            d_loss_real = - torch.mean(out_src)
-            d_loss_cls = self.classification_loss(out_cls, label_org, self.dataset)
-
-            # Compute loss with fake images.
-            """x_fake = self.G(x_real, c_trg)"""
-            prompt = self.selected_attrs[random_false_idx]
-            
-            text_encoder_model = 'google/flan-t5-large'
-            tokenizer = T5Tokenizer.from_pretrained(text_encoder_model)
-            encoder = T5EncoderModel.from_pretrained(text_encoder_model).to(self.device)
-            context = tokenizer(prompt, return_tensors='pt',
-                                padding='max_length', truncation=True, max_length=128).to(self.device)
-            context = encoder(**context).last_hidden_state
-            
-            x_real = torch.tensor(x_real, dtype=torch.long).to(self.device)
-            x_fake = self.G.generate(
-                    0, self.generate_length, condition=None, num_target_measures=None,
-                    sampling_method=self.sampling_method, threshold=self.threshold,
-                    temperature=self.temperature, context=context, input_note=x_real
-                )
-            
-            """out_src, out_cls = self.D(x_fake.detach())"""
-            x_fake_D = self.amadeus_to_moonbeam(x_fake)
-            result = self.D.predict(x_fake_D, return_probabilities=False)
-            out_src, out_cls = result['predicted_class_realfake'], result['predicted_class']
-            
-            d_loss_fake = torch.mean(out_src)
-
-            # Compute loss for gradient penalty.
-            alpha = torch.rand(x_real.size(0), 1, 1, 1).to(self.device)
-            x_hat = (alpha * x_real.data + (1 - alpha) * x_fake.data).requires_grad_(True)
-            """out_src, _ = self.D(x_hat)"""
-            x_hat_D = self.amadeus_to_moonbeam(x_hat)
-            result = self.D.predict(x_hat_D, return_probabilities=False)
-            out_src, _ = result['predicted_class_realfake'], result['predicted_class']
-            
-            d_loss_gp = self.gradient_penalty(out_src, x_hat)
-
-            # Backward and optimize.
-            d_loss = d_loss_real + d_loss_fake + self.lambda_cls * d_loss_cls + self.lambda_gp * d_loss_gp
-            self.reset_grad()
-            d_loss.backward()
-            self.d_optimizer.step()
-
-            # Logging.
-            loss = {}
-            loss['D/loss_real'] = d_loss_real.item()
-            loss['D/loss_fake'] = d_loss_fake.item()
-            loss['D/loss_cls'] = d_loss_cls.item()
-            loss['D/loss_gp'] = d_loss_gp.item()
-            
-            # =================================================================================== #
-            #                               3. Train the generator                                #
-            # =================================================================================== #
-            
-            if (i+1) % self.n_critic == 0:
-                # Original-to-target domain.
-                """x_fake = self.G(x_real, c_trg)"""
-                # 生成譜面の音符属性表現列を取得
-                x_fake = self.G.generate(
-                    0, self.generate_length, condition=None, num_target_measures=None,
-                    sampling_method=self.sampling_method, threshold=self.threshold,
-                    temperature=self.temperature, context=context, input_note=x_real
-                )
-                # ＜Amadeus表現⇒Moonbeam表現へ変換＞
-                x_fake_D = self.amadeus_to_moonbeam(x_fake)
-                
-                """out_src, out_cls = self.D(x_fake)"""
-                result = self.D.predict(x_fake_D, return_probabilities=False)
-                out_src, out_cls = result['predicted_class_realfake'], result['predicted_class']
-                
-                g_loss_fake = - torch.mean(out_src)
-                g_loss_cls = self.classification_loss(out_cls, label_trg, self.dataset)
-
-                # Target-to-original domain.
-                """x_reconst = self.G(x_fake, c_org)"""
-                x_reconst = self.G.generate(
-                    0, self.generate_length, condition=None, num_target_measures=None,
-                    sampling_method=self.sampling_method, threshold=self.threshold,
-                    temperature=self.temperature, context=context, input_note=x_fake
-                )
-                
-                g_loss_rec = torch.mean(torch.abs(x_real - x_reconst))
-
-                # Backward and optimize.
-                g_loss = g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_cls * g_loss_cls
-                self.reset_grad()
-                g_loss.backward()
-                self.g_optimizer.step()
-
-                # Logging.
-                loss['G/loss_fake'] = g_loss_fake.item()
-                loss['G/loss_rec'] = g_loss_rec.item()
-                loss['G/loss_cls'] = g_loss_cls.item()
-
-            # =================================================================================== #
-            #                                 4. Miscellaneous                                    #
-            # =================================================================================== #
-
-            # Print out training information.
-            if (i+1) % self.log_step == 0:
-                et = time.time() - start_time
-                et = str(datetime.timedelta(seconds=et))[:-7]
-                log = "Elapsed [{}], Iteration [{}/{}]".format(et, i+1, self.num_iters)
-                for tag, value in loss.items():
-                    log += ", {}: {:.4f}".format(tag, value)
-                print(log)
-
-                if self.use_tensorboard:
-                    for tag, value in loss.items():
-                        self.logger.scalar_summary(tag, value, i+1)
-
-            # Translate fixed images for debugging.
-            if (i+1) % self.sample_step == 0:
-                with torch.no_grad():
-                    x_fake_list = [x_fixed]
-                    for c_fixed in c_fixed_list:
-                        x_fake_list.append(self.G(x_fixed, c_fixed))
-                    x_concat = torch.cat(x_fake_list, dim=3)
-                    sample_path = os.path.join(self.sample_dir, '{}-images.jpg'.format(i+1))
-                    save_image(self.denorm(x_concat.data.cpu()), sample_path, nrow=1, padding=0)
-                    print('Saved real and fake images into {}...'.format(sample_path))
-
-            # Save model checkpoints.
-            if (i+1) % self.model_save_step == 0:
-                G_path = os.path.join(self.model_save_dir, '{}-G.ckpt'.format(i+1))
-                D_path = os.path.join(self.model_save_dir, '{}-D.ckpt'.format(i+1))
-                torch.save(self.G.state_dict(), G_path)
-                torch.save(self.D.state_dict(), D_path)
-                print('Saved model checkpoints into {}...'.format(self.model_save_dir))
-
-            # Decay learning rates.
-            if (i+1) % self.lr_update_step == 0 and (i+1) > (self.num_iters - self.num_iters_decay):
-                g_lr -= (self.g_lr / float(self.num_iters_decay))
-                d_lr -= (self.d_lr / float(self.num_iters_decay))
-                self.update_lr(g_lr, d_lr)
-                print ('Decayed learning rates, g_lr: {}, d_lr: {}.'.format(g_lr, d_lr))
-
-    def train_multi(self):
-        """Train StarGAN with multiple datasets."""        
-        # Data iterators.
-        celeba_iter = iter(self.celeba_loader)
-        rafd_iter = iter(self.rafd_loader)
-
-        # Fetch fixed inputs for debugging.
-        x_fixed, c_org = next(celeba_iter)
-        x_fixed = x_fixed.to(self.device)
-        c_celeba_list = self.create_labels(c_org, self.c_dim, 'CelebA', self.selected_attrs)
-        c_rafd_list = self.create_labels(c_org, self.c2_dim, 'RaFD')
-        zero_celeba = torch.zeros(x_fixed.size(0), self.c_dim).to(self.device)           # Zero vector for CelebA.
-        zero_rafd = torch.zeros(x_fixed.size(0), self.c2_dim).to(self.device)             # Zero vector for RaFD.
-        mask_celeba = self.label2onehot(torch.zeros(x_fixed.size(0)), 2).to(self.device)  # Mask vector: [1, 0].
-        mask_rafd = self.label2onehot(torch.ones(x_fixed.size(0)), 2).to(self.device)     # Mask vector: [0, 1].
-
-        # Learning rate cache for decaying.
-        g_lr = self.g_lr
-        d_lr = self.d_lr
-
-        # Start training from scratch or resume training.
-        start_iters = 0
-        if self.resume_iters:
-            start_iters = self.resume_iters
-            self.restore_model(self.resume_iters)
-
-        # Start training.
-        print('Start training...')
-        start_time = time.time()
-        for i in range(start_iters, self.num_iters):
-            for dataset in ['CelebA', 'RaFD']:
-
-                # =================================================================================== #
-                #                             1. Preprocess input data                                #
-                # =================================================================================== #
-                
-                # Fetch real images and labels.
-                data_iter = celeba_iter if dataset == 'CelebA' else rafd_iter
-                
-                try:
-                    x_real, label_org = next(data_iter)
-                except:
-                    if dataset == 'CelebA':
-                        celeba_iter = iter(self.celeba_loader)
-                        x_real, label_org = next(celeba_iter)
-                    elif dataset == 'RaFD':
-                        rafd_iter = iter(self.rafd_loader)
-                        x_real, label_org = next(rafd_iter)
-
-                # Generate target domain labels randomly.
-                rand_idx = torch.randperm(label_org.size(0))
-                label_trg = label_org[rand_idx]
-
-                if dataset == 'CelebA':
-                    c_org = label_org.clone()
-                    c_trg = label_trg.clone()
-                    zero = torch.zeros(x_real.size(0), self.c2_dim)
-                    mask = self.label2onehot(torch.zeros(x_real.size(0)), 2)
-                    c_org = torch.cat([c_org, zero, mask], dim=1)
-                    c_trg = torch.cat([c_trg, zero, mask], dim=1)
-                elif dataset == 'RaFD':
-                    c_org = self.label2onehot(label_org, self.c2_dim)
-                    c_trg = self.label2onehot(label_trg, self.c2_dim)
-                    zero = torch.zeros(x_real.size(0), self.c_dim)
-                    mask = self.label2onehot(torch.ones(x_real.size(0)), 2)
-                    c_org = torch.cat([zero, c_org, mask], dim=1)
-                    c_trg = torch.cat([zero, c_trg, mask], dim=1)
-
-                x_real = x_real.to(self.device)             # Input images.
-                c_org = c_org.to(self.device)               # Original domain labels.
-                c_trg = c_trg.to(self.device)               # Target domain labels.
-                label_org = label_org.to(self.device)       # Labels for computing classification loss.
-                label_trg = label_trg.to(self.device)       # Labels for computing classification loss.
-
-                # =================================================================================== #
-                #                             2. Train the discriminator                              #
-                # =================================================================================== #
-
-                # Compute loss with real images.
-                out_src, out_cls = self.D(x_real)
-                out_cls = out_cls[:, :self.c_dim] if dataset == 'CelebA' else out_cls[:, self.c_dim:]
-                d_loss_real = - torch.mean(out_src)
-                d_loss_cls = self.classification_loss(out_cls, label_org, dataset)
-
-                # Compute loss with fake images.
-                x_fake = self.G(x_real, c_trg)
-                out_src, _ = self.D(x_fake.detach())
-                d_loss_fake = torch.mean(out_src)
-
-                # Compute loss for gradient penalty.
-                alpha = torch.rand(x_real.size(0), 1, 1, 1).to(self.device)
-                x_hat = (alpha * x_real.data + (1 - alpha) * x_fake.data).requires_grad_(True)
-                out_src, _ = self.D(x_hat)
-                d_loss_gp = self.gradient_penalty(out_src, x_hat)
-
-                # Backward and optimize.
-                d_loss = d_loss_real + d_loss_fake + self.lambda_cls * d_loss_cls + self.lambda_gp * d_loss_gp
-                self.reset_grad()
-                d_loss.backward()
-                self.d_optimizer.step()
-
-                # Logging.
-                loss = {}
-                loss['D/loss_real'] = d_loss_real.item()
-                loss['D/loss_fake'] = d_loss_fake.item()
-                loss['D/loss_cls'] = d_loss_cls.item()
-                loss['D/loss_gp'] = d_loss_gp.item()
-            
-                # =================================================================================== #
-                #                               3. Train the generator                                #
-                # =================================================================================== #
-
-                if (i+1) % self.n_critic == 0:
-                    # Original-to-target domain.
-                    x_fake = self.G(x_real, c_trg)
-                    out_src, out_cls = self.D(x_fake)
-                    out_cls = out_cls[:, :self.c_dim] if dataset == 'CelebA' else out_cls[:, self.c_dim:]
-                    g_loss_fake = - torch.mean(out_src)
-                    g_loss_cls = self.classification_loss(out_cls, label_trg, dataset)
-
-                    # Target-to-original domain.
-                    x_reconst = self.G(x_fake, c_org)
-                    g_loss_rec = torch.mean(torch.abs(x_real - x_reconst))
-
-                    # Backward and optimize.
-                    g_loss = g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_cls * g_loss_cls
-                    self.reset_grad()
-                    g_loss.backward()
-                    self.g_optimizer.step()
-
-                    # Logging.
-                    loss['G/loss_fake'] = g_loss_fake.item()
-                    loss['G/loss_rec'] = g_loss_rec.item()
-                    loss['G/loss_cls'] = g_loss_cls.item()
-
-                # =================================================================================== #
-                #                                 4. Miscellaneous                                    #
-                # =================================================================================== #
-
-                # Print out training info.
-                if (i+1) % self.log_step == 0:
-                    et = time.time() - start_time
-                    et = str(datetime.timedelta(seconds=et))[:-7]
-                    log = "Elapsed [{}], Iteration [{}/{}], Dataset [{}]".format(et, i+1, self.num_iters, dataset)
-                    for tag, value in loss.items():
-                        log += ", {}: {:.4f}".format(tag, value)
-                    print(log)
-
-                    if self.use_tensorboard:
-                        for tag, value in loss.items():
-                            self.logger.scalar_summary(tag, value, i+1)
-
-            # Translate fixed images for debugging.
-            if (i+1) % self.sample_step == 0:
-                with torch.no_grad():
-                    x_fake_list = [x_fixed]
-                    for c_fixed in c_celeba_list:
-                        c_trg = torch.cat([c_fixed, zero_rafd, mask_celeba], dim=1)
-                        x_fake_list.append(self.G(x_fixed, c_trg))
-                    for c_fixed in c_rafd_list:
-                        c_trg = torch.cat([zero_celeba, c_fixed, mask_rafd], dim=1)
-                        x_fake_list.append(self.G(x_fixed, c_trg))
-                    x_concat = torch.cat(x_fake_list, dim=3)
-                    sample_path = os.path.join(self.sample_dir, '{}-images.jpg'.format(i+1))
-                    save_image(self.denorm(x_concat.data.cpu()), sample_path, nrow=1, padding=0)
-                    print('Saved real and fake images into {}...'.format(sample_path))
-
-            # Save model checkpoints.
-            if (i+1) % self.model_save_step == 0:
-                G_path = os.path.join(self.model_save_dir, '{}-G.ckpt'.format(i+1))
-                D_path = os.path.join(self.model_save_dir, '{}-D.ckpt'.format(i+1))
-                torch.save(self.G.state_dict(), G_path)
-                torch.save(self.D.state_dict(), D_path)
-                print('Saved model checkpoints into {}...'.format(self.model_save_dir))
-
-            # Decay learning rates.
-            if (i+1) % self.lr_update_step == 0 and (i+1) > (self.num_iters - self.num_iters_decay):
-                g_lr -= (self.g_lr / float(self.num_iters_decay))
-                d_lr -= (self.d_lr / float(self.num_iters_decay))
-                self.update_lr(g_lr, d_lr)
-                print ('Decayed learning rates, g_lr: {}, d_lr: {}.'.format(g_lr, d_lr))
-
-    def test(self):
-        """Translate images using StarGAN trained on a single dataset."""
-        # Load the trained generator.
-        self.restore_model(self.test_iters)
-        
-        # Set data loader.
-        if self.dataset == 'CelebA':
-            data_loader = self.celeba_loader
-        elif self.dataset == 'RaFD':
-            data_loader = self.rafd_loader
-        
-        with torch.no_grad():
-            for i, (x_real, c_org) in enumerate(data_loader):
-
-                # Prepare input images and target domain labels.
-                x_real = x_real.to(self.device)
-                c_trg_list = self.create_labels(c_org, self.c_dim, self.dataset, self.selected_attrs)
-
-                # Translate images.
-                x_fake_list = [x_real]
-                for c_trg in c_trg_list:
-                    x_fake_list.append(self.G(x_real, c_trg))
-
-                # Save the translated images.
-                x_concat = torch.cat(x_fake_list, dim=3)
-                result_path = os.path.join(self.result_dir, '{}-images.jpg'.format(i+1))
-                save_image(self.denorm(x_concat.data.cpu()), result_path, nrow=1, padding=0)
-                print('Saved real and fake images into {}...'.format(result_path))
-
-    def test_multi(self):
-        """Translate images using StarGAN trained on multiple datasets."""
-        # Load the trained generator.
-        self.restore_model(self.test_iters)
-        
-        with torch.no_grad():
-            for i, (x_real, c_org) in enumerate(self.celeba_loader):
-
-                # Prepare input images and target domain labels.
-                x_real = x_real.to(self.device)
-                c_celeba_list = self.create_labels(c_org, self.c_dim, 'CelebA', self.selected_attrs)
-                c_rafd_list = self.create_labels(c_org, self.c2_dim, 'RaFD')
-                zero_celeba = torch.zeros(x_real.size(0), self.c_dim).to(self.device)            # Zero vector for CelebA.
-                zero_rafd = torch.zeros(x_real.size(0), self.c2_dim).to(self.device)             # Zero vector for RaFD.
-                mask_celeba = self.label2onehot(torch.zeros(x_real.size(0)), 2).to(self.device)  # Mask vector: [1, 0].
-                mask_rafd = self.label2onehot(torch.ones(x_real.size(0)), 2).to(self.device)     # Mask vector: [0, 1].
-
-                # Translate images.
-                x_fake_list = [x_real]
-                for c_celeba in c_celeba_list:
-                    c_trg = torch.cat([c_celeba, zero_rafd, mask_celeba], dim=1)
-                    x_fake_list.append(self.G(x_real, c_trg))
-                for c_rafd in c_rafd_list:
-                    c_trg = torch.cat([zero_celeba, c_rafd, mask_rafd], dim=1)
-                    x_fake_list.append(self.G(x_real, c_trg))
-
-                # Save the translated images.
-                x_concat = torch.cat(x_fake_list, dim=3)
-                result_path = os.path.join(self.result_dir, '{}-images.jpg'.format(i+1))
-                save_image(self.denorm(x_concat.data.cpu()), result_path, nrow=1, padding=0)
-                print('Saved real and fake images into {}...'.format(result_path))

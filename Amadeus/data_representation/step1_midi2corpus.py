@@ -8,11 +8,13 @@ from multiprocessing import Pool, cpu_count
 from collections import defaultdict
 from fractions import Fraction
 from typing import List
+import signal
 import os
 from muspy import sort
 import numpy as np
 import pickle
 from tqdm import tqdm
+import sys
 
 import miditoolkit
 from miditoolkit.midi.containers import Marker, Instrument
@@ -67,6 +69,8 @@ class CorpusMaker():
     self.midi_path = in_dir / f"{dataset_name}"
     self.out_dir = out_dir
     self.debug = debug
+    self.process_timeout = 60  # seconds to wait before skipping a stuck MIDI
+    self.global_idle_timeout = 120  # main process watchdog
     self._get_in_beat_resolution()
     self._get_duration_bins()
     self._get_velocity_tempo_bins()
@@ -156,6 +160,8 @@ class CorpusMaker():
         message = self._mp_midi2corpus(file_path)
         if message == "error":
           broken_counter += 1
+        elif message == "timeout":
+          broken_counter += 1
         elif message == "success":
           success_counter += 1
     else:
@@ -174,9 +180,21 @@ class CorpusMaker():
       # reverse the list to process the latest files first
       self.midi_list.reverse()
       print(f"length of midi list after filtering: ", len(self.midi_list))
-      with Pool(8) as p:
-        for message in tqdm(p.imap(self._mp_midi2corpus, self.midi_list, 50), total=len(self.midi_list)):
+      
+      prev_main_handler = signal.getsignal(signal.SIGALRM)
+      def _idle_handler(signum, frame):
+        print(f"No progress for {self.global_idle_timeout}s. Exiting.")
+        sys.exit(1)
+
+      signal.signal(signal.SIGALRM, _idle_handler)
+      signal.alarm(self.global_idle_timeout)
+      
+      with Pool(16) as p:
+        for message in tqdm(p.imap(self._mp_midi2corpus, self.midi_list, 100), total=len(self.midi_list)):
+          signal.alarm(self.global_idle_timeout)
           if message == "error":
+            broken_counter += 1
+          elif message == "timeout":
             broken_counter += 1
           elif message == "success":
             success_counter += 1
@@ -187,9 +205,17 @@ class CorpusMaker():
         # elif message == "success":
         #   success_counter += 1
     print(f"Making corpus takes: {time.time() - start_time}s, success: {success_counter}, broken: {broken_counter}")
+    signal.alarm(0)
+    signal.signal(signal.SIGALRM, prev_main_handler)
 
   def _mp_midi2corpus(self, file_path: Path):
       """Convert MIDI to corpus format and save both corpus (.pkl) and MIDI (.mid)."""
+      def _timeout_handler(signum, frame):
+        raise TimeoutError("MIDI processing timed out")
+
+      prev_handler = signal.getsignal(signal.SIGALRM)
+      signal.signal(signal.SIGALRM, _timeout_handler)
+      signal.alarm(self.process_timeout)
       try:
           midi_obj = self._analyze(file_path)
           corpus, midi_obj = self._midi2corpus(midi_obj)
@@ -207,19 +233,27 @@ class CorpusMaker():
           midi_save_path = midi_save_dir / file_path.name  # Keep original MIDI filename
           midi_obj.dump(midi_save_path)
 
-          del midi_obj.instruments[:]
+          #del midi_obj.instruments[:]
           del midi_obj, corpus
-          gc.collect()
+          #gc.collect()
           return "success"
+
+      except TimeoutError:
+        print(f"Timeout processing {file_path.name}, skipping")
+        return "timeout"
 
       except (OSError, EOFError, ValueError, KeyError, AssertionError) as e:
           print(f"Error processing {file_path.name}: {e}")
-          gc.collect()
+          #gc.collect()
           return "error"
       except Exception as e:
           print(f"Unexpected error in {file_path.name}: {e}")
-          gc.collect()
+          #gc.collect()
           return "error"
+      finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, prev_handler)
+        
   def _check_length(self, last_time:float):
     if last_time < self.min_last_time:
       raise ValueError(f"last time {last_time} is out of range")

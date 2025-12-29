@@ -7,14 +7,16 @@ import os
 import random
 import json
 import numpy as np
+from pathlib import Path
 
 
 class MusicDataset(data.Dataset):
     """Dataset class for the Music dataset."""
 
-    def __init__(self, score_dir, attr_path, selected_attrs, mode):
+    def __init__(self, score_dir, encoding, attr_path, selected_attrs, mode):
         """Initialize and preprocess the Music dataset."""
         self.score_dir = score_dir
+        self.encoding = encoding
         self.attr_path = attr_path
         self.selected_attrs = selected_attrs
         self.mode = mode
@@ -57,7 +59,10 @@ class MusicDataset(data.Dataset):
         """Return one score and its corresponding attribute label."""
         dataset = self.train_dataset if self.mode == 'train' else self.test_dataset
         filepath, label = dataset[index]
-        filepath = self.score_dir + filepath.removesuffix(".mid") + ".npz"
+        parts = list(Path(filepath).parts)
+        parts.insert(2, self.encoding)
+        filepath = Path(*parts)
+        filepath = self.score_dir + str(filepath).removesuffix(".mid") + ".npz"
         score = np.load(filepath)['arr_0']
         return score, label
 
@@ -66,12 +71,11 @@ class MusicDataset(data.Dataset):
         return self.num_images
 
 
-def get_loader(score_dir, attr_path, selected_attrs, 
+def get_loader(score_dir, encoding, attr_path, selected_attrs, 
                batch_size=1, dataset='Score', mode='train', num_workers=1):
     """Build and return a data loader."""
 
-    dataset = MusicDataset(score_dir, attr_path, selected_attrs, mode)
-
+    dataset = MusicDataset(score_dir, encoding, attr_path, selected_attrs, mode)
     data_loader = data.DataLoader(dataset=dataset,
                                   batch_size=batch_size,
                                   shuffle=(mode=='train'),
