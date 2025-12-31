@@ -24,6 +24,11 @@ from transformers import (
     LlamaConfig,
     LlamaPreTrainedModel,
 )
+import sys
+from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+
 from llama_recipes.datasets.music_tokenizer import MusicTokenizer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaModel
 
@@ -59,6 +64,7 @@ from accelerate.utils import is_xpu_available
 """カスタムモデルの出力クラス"""
 from transformers.utils import ModelOutput
 from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
 
 @dataclass
 class DoubleClassifierOutputWithPast(ModelOutput):
@@ -77,7 +83,6 @@ class DoubleClassifierOutputWithPast(ModelOutput):
 
 """ソース真偽判定用線形層追加モデル"""
 from torch import nn
-from typing import List, Optional, Tuple, Union
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.models.llama.modeling_llama import LLAMA_INPUTS_DOCSTRING
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast

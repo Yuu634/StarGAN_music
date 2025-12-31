@@ -9,13 +9,17 @@ import os
 import time
 import datetime
 import re
-from Amadeus.Amadeus import model_zoo
-from transformers import T5Tokenizer, T5EncoderModel
+import json
+from transformers import T5Tokenizer, T5EncoderModel, LlamaConfig
 import sys
-sys.path.append("Moonbeam-MIDI-Foundation-Model")
-from inference import ScoreArrangeDomainClassifier
+sys.path.append("../Moonbeam-MIDI-Foundation-Model")
+#from inference import ScoreArrangeDomainClassifier
+from src.llama_recipes.real_finetuning_player_classification import LlamaForSequenceDoubleClassification
 sys.path.append("../Amadeus")
 from generate import load_resources
+from Amadeus import model_zoo
+
+AMAEDEUS_FIELDS = ["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"]
 
 class Solver(object):
     """Solver for training and testing StarGAN."""
@@ -44,9 +48,12 @@ class Solver(object):
         self.sampling_method = config.sampling_method
         self.threshold = config.threshold
         self.temperature = config.temperature
+        self.encoding = config.encoding
         
         # Discriminator configurations.
         self.d_modelpath = config.d_modelpath
+        self.d_configpath = config.d_configpath
+        self.num_labels = len(config.selected_attrs)
 
         # Training configurations.
         self.dataset = config.dataset
@@ -69,6 +76,7 @@ class Solver(object):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Directories.
+        self.vocab_path = config.vocab_path
         self.log_dir = config.log_dir
         self.sample_dir = config.sample_dir
         self.model_save_dir = config.model_save_dir
@@ -90,28 +98,20 @@ class Solver(object):
         if self.dataset in ['MidiCaps']:
             """self.G = Generator(self.g_conv_dim, self.c_dim, self.g_repeat_num)"""
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            config, self.G, vocab = load_resources(self.g_modelpath, device)
+            config_G, self.G, vocab_G = load_resources(self.g_modelpath, device)
             
             """self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim, self.d_repeat_num)"""
-            self.D = ScoreArrangeDomainClassifier(
+            """self.D = ScoreArrangeDomainClassifier(
                 pretrained_checkpoint="../Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_839M.pt",
                 lora_adapter_path=self.d_modelpath,
                 config_path="../Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config.json",
                 device="cuda" if torch.cuda.is_available() else "cpu",
                 selected_attr = self.selected_attrs
-            )
-        elif self.dataset in ['Both']:
-            """self.G = Generator(self.g_conv_dim, self.c_dim+self.c2_dim+2, self.g_repeat_num)   # 2 for mask vector."""
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            config, self.G, vocab = load_resources(self.g_modelpath, device)
-            
-            """self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim+self.c2_dim, self.d_repeat_num)"""
-            self.D = ScoreArrangeDomainClassifier(
-                pretrained_checkpoint="../Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_839M.pt",
-                lora_adapter_path=self.d_modelpath,
-                config_path="../Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config.json",
-                device="cuda" if torch.cuda.is_available() else "cpu"
-            )
+            )"""
+            D_config = LlamaConfig.from_pretrained(self.d_configpath)
+            D_config.use_cache = False
+            D_config.num_labels = len(self.selected_attrs)
+            self.D = LlamaForSequenceDoubleClassification(D_config)
 
         self.g_optimizer = torch.optim.Adam(self.G.parameters(), self.g_lr, [self.beta1, self.beta2])
         self.d_optimizer = torch.optim.Adam(self.D.parameters(), self.d_lr, [self.beta1, self.beta2])
@@ -181,8 +181,9 @@ class Solver(object):
         out[np.arange(batch_size), labels.long()] = 1
         return out
 
-    def create_labels(self, c_org, c_dim=5, dataset='CelebA', selected_attrs=None):
+    def create_labels(self, c_org, c_dim=5, selected_attrs=None):
         """Generate target domain labels for debugging and testing."""
+        c_org = torch.tensor(c_org)
         c_dim = len(c_org)
         c_trg_list = []
         for i in range(c_dim):
@@ -197,7 +198,29 @@ class Solver(object):
         elif dataset == 'RaFD':
             return F.cross_entropy(logit, target)
 
-    def amadeus_to_moonbeam(self, amadeus_tokens, time_resolution=10, default_tempo=120, in_beat_resolution=4):
+    def _build_lookup_table(self, field_dict: dict[str, str]) -> np.ndarray:
+        max_idx = max(int(k) for k in field_dict.keys())
+        table = ["" for _ in range(max_idx + 1)]
+        for k, v in field_dict.items():
+            table[int(k)] = v
+        return np.array(table, dtype=object)
+    
+    def amadeus_to_vocab(self, amadeus_tokens: torch.Tensor, vocab_path: str) -> np.ndarray:
+        """Amadeusのトークン列を語彙に変換し、amadeus_to_moonbeam利用可能な形式に"""
+        with open(vocab_path, "r", encoding="utf-8") as f:
+            vocab = json.load(f)
+
+        amadeus_tokens = amadeus_tokens.squeeze(0)
+        tokens_np = amadeus_tokens.detach().cpu().numpy().astype(np.int64)
+        decoded = np.empty(tokens_np.shape, dtype=object)
+
+        for axis, field in enumerate(AMAEDEUS_FIELDS):
+            lookup = self._build_lookup_table(vocab[field])
+            decoded[:, axis] = lookup[tokens_np[:, axis]]
+
+        return decoded
+    
+    def vocab_to_moonbeam(self, amadeus_vocabs, time_resolution=10, default_tempo=120, in_beat_resolution=4):
         # (Beat + 小節数) * Tempo → onset(ms)
         # duration * Tempo → duration(ms)
         # pitch → octave*12 + pitch_class
@@ -226,14 +249,14 @@ class Solver(object):
         """
         
         # Convert to numpy for easier processing
-        if isinstance(amadeus_tokens, torch.Tensor):
-            amadeus_np = amadeus_tokens.cpu().numpy()
+        if isinstance(amadeus_vocabs, torch.Tensor):
+            amadeus_np = amadeus_vocabs.cpu().numpy()
             use_torch = True
-        elif isinstance(amadeus_tokens, list):
-            amadeus_np = np.array(amadeus_tokens)
+        elif isinstance(amadeus_vocabs, list):
+            amadeus_np = np.array(amadeus_vocabs)
             use_torch = False
         else:
-            amadeus_np = np.array(amadeus_tokens)
+            amadeus_np = np.array(amadeus_vocabs)
             use_torch = False
         
         # Check shape and transpose if needed
@@ -248,7 +271,11 @@ class Solver(object):
         current_tempo = default_tempo
         current_time_signature = (4, 4)  # (numerator, denominator)
         
-        for i in range(num_notes):
+        # First note
+        for k in range(6):
+            moonbeam_np[0, k] = 0
+        
+        for i in range(1, num_notes):
             type_token = amadeus_np[i, 0]
             beat_token = amadeus_np[i, 1]
             chord_token = amadeus_np[i, 2]
@@ -374,9 +401,18 @@ class Solver(object):
 
         # Fetch fixed inputs for debugging.
         data_iter = iter(data_loader)
-        x_fixed, c_org = next(data_iter)
+        while True:
+            try:
+                x_fixed, c_org = next(data_iter)
+                break
+            except StopIteration:
+                data_iter = iter(data_loader)
+                continue
+            except FileNotFoundError:
+                continue
+            
         x_fixed = x_fixed.to(self.device)
-        c_fixed_list = self.create_labels(c_org, self.c_dim, self.dataset, self.selected_attrs)
+        #c_fixed_list = self.create_labels(c_org, self.c_dim, self.selected_attrs)
 
         # Learning rate cache for decaying.
         g_lr = self.g_lr
@@ -400,9 +436,11 @@ class Solver(object):
             # Fetch real images and labels.
             try:
                 x_real, label_org = next(data_iter)
-            except:
+            except StopIteration:
                 data_iter = iter(data_loader)
-                x_real, label_org = next(data_iter)
+                continue
+            except FileNotFoundError:
+                continue
             label_org = label_org.squeeze(0)
             
             # Generate target domain labels randomly.
@@ -429,7 +467,8 @@ class Solver(object):
 
             # Compute loss with real images.
             """out_src, out_cls = self.D(x_real)"""
-            x_real_D = self.amadeus_to_moonbeam(x_real)
+            D_vocab = self.amadeus_to_vocab(x_real, vocab_path=self.vocab_path)
+            x_real_D = self.vocab_to_moonbeam(D_vocab)
             result = self.D.predict(x_real_D, return_probabilities=False)
             out_src, out_cls = result['predicted_class_realfake'], result['predicted_class']
             
@@ -498,7 +537,8 @@ class Solver(object):
                     temperature=self.temperature, context=context, input_note=x_real
                 )
                 # ＜Amadeus表現⇒Moonbeam表現へ変換＞
-                x_fake_D = self.amadeus_to_moonbeam(x_fake)
+                D_vocab = self.amadeus_to_vocab(x_fake, vocab_path=self.vocab_path)
+                x_fake_D = self.vocab_to_moonbeam(D_vocab)
                 
                 """out_src, out_cls = self.D(x_fake)"""
                 result = self.D.predict(x_fake_D, return_probabilities=False)
@@ -580,8 +620,8 @@ class Solver(object):
         # Fetch fixed inputs for debugging.
         x_fixed, c_org = next(celeba_iter)
         x_fixed = x_fixed.to(self.device)
-        c_celeba_list = self.create_labels(c_org, self.c_dim, 'CelebA', self.selected_attrs)
-        c_rafd_list = self.create_labels(c_org, self.c2_dim, 'RaFD')
+        c_celeba_list = self.create_labels(c_org, self.c_dim, self.selected_attrs)
+        c_rafd_list = self.create_labels(c_org, self.c2_dim)
         zero_celeba = torch.zeros(x_fixed.size(0), self.c_dim).to(self.device)           # Zero vector for CelebA.
         zero_rafd = torch.zeros(x_fixed.size(0), self.c2_dim).to(self.device)             # Zero vector for RaFD.
         mask_celeba = self.label2onehot(torch.zeros(x_fixed.size(0)), 2).to(self.device)  # Mask vector: [1, 0].
@@ -792,8 +832,8 @@ class Solver(object):
 
                 # Prepare input images and target domain labels.
                 x_real = x_real.to(self.device)
-                c_celeba_list = self.create_labels(c_org, self.c_dim, 'CelebA', self.selected_attrs)
-                c_rafd_list = self.create_labels(c_org, self.c2_dim, 'RaFD')
+                c_celeba_list = self.create_labels(c_org, self.c_dim, self.selected_attrs)
+                c_rafd_list = self.create_labels(c_org, self.c2_dim)
                 zero_celeba = torch.zeros(x_real.size(0), self.c_dim).to(self.device)            # Zero vector for CelebA.
                 zero_rafd = torch.zeros(x_real.size(0), self.c2_dim).to(self.device)             # Zero vector for RaFD.
                 mask_celeba = self.label2onehot(torch.zeros(x_real.size(0)), 2).to(self.device)  # Mask vector: [1, 0].

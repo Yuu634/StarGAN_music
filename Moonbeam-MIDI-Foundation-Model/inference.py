@@ -35,7 +35,7 @@ class ScoreArrangeDomainClassifier:
         # 1. 設定ファイルを読み込み
         llama_config = LlamaConfig.from_pretrained(self.config_path)
         llama_config.use_cache = False
-        llama_config.num_labels = 
+        llama_config.num_labels = len(self.selected_attr)
         
         print(f"Model config: {llama_config}")
         print(f"Number of labels: {llama_config.num_labels}")
