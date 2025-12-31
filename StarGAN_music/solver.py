@@ -97,7 +97,7 @@ class Solver(object):
                 pretrained_checkpoint="../Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_839M.pt",
                 lora_adapter_path=self.d_modelpath,
                 config_path="../Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config.json",
-                device="cuda" if torch.cuda.is_available() else "cpu"
+                device="cuda" if torch.cuda.is_available() else "cpu",
                 selected_attr = self.selected_attrs
             )
         elif self.dataset in ['Both']:
