@@ -364,6 +364,7 @@ class XtransformerCrossAttendDecoder(nn.Module):
 
   def forward(self, seq, cache=None,train=False,context=None,context_embedding=None):
     assert context is not None or context_embedding is not None, 'context or context_embedding should be provided for prefix decoder'
+    context_embedding = context
     if context_embedding is None:
       input_ids = context['input_ids'].squeeze(1) if context['input_ids'].ndim == 3 else context['input_ids']
       attention_mask = context['attention_mask'].squeeze(1) if context['attention_mask'].ndim == 3 else context['attention_mask']

@@ -83,9 +83,19 @@ class DoubleClassifierOutputWithPast(ModelOutput):
 """ソース真偽判定用線形層追加モデル"""
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from transformers.models.llama.modeling_llama import LLAMA_INPUTS_DOCSTRING
+# Handle transformers version compatibility
+try:
+    from transformers.models.llama.modeling_llama import LLAMA_INPUTS_DOCSTRING
+except ImportError:
+    LLAMA_INPUTS_DOCSTRING = ""
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
-from transformers.utils import add_start_docstrings_to_model_forward
+try:
+    from transformers.utils import add_start_docstrings_to_model_forward
+except ImportError:
+    def add_start_docstrings_to_model_forward(docstring):
+        def decorator(func):
+            return func
+        return decorator
 from transformers.cache_utils import Cache
 
 class LlamaForSequenceDoubleClassification(
@@ -133,11 +143,19 @@ class LlamaForSequenceDoubleClassification(
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         #outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        position_ids = input_ids
+        
+        # Generate sequential position_ids for standard Llama rotary embedding
+        if position_ids is None and input_ids is not None:
+            device = input_ids.device
+            batch_size, seq_length = input_ids.shape
+            position_ids = torch.arange(
+                seq_length, dtype=torch.long, device=device
+            ).unsqueeze(0).expand(batch_size, -1)
+        
         transformer_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            position_ids=position_ids, #if sdpa: position_ids carry information about onset, dur, pitch, instr, vel; elif sdpa_baseline: position_ids are None
+            position_ids=position_ids,  # Use sequential indices for rotary embedding
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
@@ -151,8 +169,40 @@ class LlamaForSequenceDoubleClassification(
         logits = self.score(hidden_states)
         real_fake_logits = self.real_fake_score(hidden_states)
 
-        where_eos = (input_ids[..., 0] == self.classification_token)
-        batch_indices, seq_indices = where_eos.nonzero(as_tuple=True)
+        # Find classification token positions: tokens where first feature == classification_token
+        # This applies to the flattened representation where every 6th token (onset feature) is checked
+        where_cls = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        
+        # For simplicity, use the last valid token in each sequence as the classification point
+        # (after padding is added by _pad_moonbeam_sequence)
+        batch_size = input_ids.shape[0]
+        seq_length = input_ids.shape[1]
+        
+        # Try to find where classification_token appears
+        # Since features are flattened [feat0_s0, feat1_s0, ..., feat0_s1, ...], 
+        # and _pad_moonbeam_sequence adds it at onset position, check every 6th position
+        for b in range(batch_size):
+            for idx in range(0, seq_length, 6):  # Every 6 tokens is a new sequence position
+                if idx < seq_length and input_ids[b, idx] == self.classification_token:
+                    where_cls[b] = True
+                    break
+        
+        # Fallback: if no classification token found, use the last sequence position
+        # by taking the position just before the padding starts
+        batch_indices = torch.arange(batch_size, device=input_ids.device)[where_cls]
+        
+        if batch_indices.numel() == 0:
+            # No classification tokens found, use last position for each batch
+            batch_indices = torch.arange(batch_size, device=input_ids.device)
+            seq_indices = torch.full((batch_size,), seq_length - 1, device=input_ids.device)
+        else:
+            # Get sequence indices for found classification tokens
+            seq_indices = torch.zeros_like(batch_indices)
+            for i, b_idx in enumerate(batch_indices):
+                for idx in range(0, seq_length, 6):
+                    if idx < seq_length and input_ids[b_idx, idx] == self.classification_token:
+                        seq_indices[i] = idx
+                        break
 
         pooled_logits = logits[batch_indices, seq_indices]
         pooled_real_fake_logits = real_fake_logits[batch_indices, seq_indices]

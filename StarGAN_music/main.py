@@ -1,34 +1,58 @@
 import os
 import argparse
+import torch
+import torch.distributed as dist
 from solver import Solver
 from data_loader import get_loader
 from torch.backends import cudnn
+
+# Optimize CUDA memory management to prevent fragmentation
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:512'
 
 
 def str2bool(v):
     return v.lower() in ('true')
 
+def init_ddp():
+    """Initialize DDP if launched with torchrun or torch.distributed.launch"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        dist.init_process_group("nccl")
+        torch.cuda.set_device(rank)
+        return rank, world_size
+    return 0, 1
+
 def main(config):
+    # Initialize DDP if running with multiple GPUs
+    rank, world_size = init_ddp()
+    is_main_process = rank == 0
+    
     # For fast training.
     cudnn.benchmark = True
 
-    # Create directories if not exist.
-    if not os.path.exists(config.log_dir):
-        os.makedirs(config.log_dir)
-    if not os.path.exists(config.model_save_dir):
-        os.makedirs(config.model_save_dir)
-    if not os.path.exists(config.sample_dir):
-        os.makedirs(config.sample_dir)
-    if not os.path.exists(config.result_dir):
-        os.makedirs(config.result_dir)
+    # Create directories if not exist (only on main process to avoid race condition)
+    if is_main_process:
+        if not os.path.exists(config.log_dir):
+            os.makedirs(config.log_dir)
+        if not os.path.exists(config.model_save_dir):
+            os.makedirs(config.model_save_dir)
+        if not os.path.exists(config.sample_dir):
+            os.makedirs(config.sample_dir)
+        if not os.path.exists(config.result_dir):
+            os.makedirs(config.result_dir)
 
-    # Data loader.
+    # Synchronize all processes after directory creation
+    if world_size > 1:
+        dist.barrier()
+
+    # Data loader (force num_workers=0 to prevent multiprocessing issues)
     score_loader = get_loader(config.score_dir, config.encoding, config.attr_path, config.selected_attrs,
-                              config.batch_size,'MidiCaps', config.mode, config.num_workers)
+                              config.batch_size,'MidiCaps', config.mode, num_workers=0)
     
 
-    # Solver for training and testing StarGAN.
-    solver = Solver(score_loader, config)
+    # Solver for training and testing StarGAN with DDP support
+    solver = Solver(score_loader, config, rank=rank, world_size=world_size)
     
     if config.mode == 'train':
         if config.dataset in ['MidiCaps']:
@@ -40,6 +64,10 @@ def main(config):
             solver.test()
         elif config.dataset in ['Both']:
             solver.test_multi()
+
+    # Cleanup DDP
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
@@ -67,7 +95,17 @@ if __name__ == '__main__':
     parser.add_argument('--temperature', type=float, default=1.15, help='temperature for sampling method')
     
     # Discriminator configuration.
-    parser.add_argument('--d_modelpath', type=str, default="../Moonbeam-MIDI-Foundation-Model/models/emotion_classification-v1", help='path to the discriminator model')
+    #parser.add_argument('--d_modelpath', type=str, default="../Moonbeam-MIDI-Foundation-Model/models/emotion_classification-v1", help='path to the discriminator model')
+    parser.add_argument('--d_modelpath', type=str, default="", help='path to the discriminator model')
+    parser.add_argument('--d_config_path', type=str, default="../Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config.json", help='path to discriminator config json')
+    parser.add_argument('--d_pretrained_checkpoint', type=str, default="../Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_839M.pt", help='base checkpoint for discriminator')
+    parser.add_argument('--d_lora_r', type=int, default=2, help='LoRA rank for discriminator (reduced for memory efficiency)')
+    parser.add_argument('--d_lora_alpha', type=int, default=8, help='LoRA alpha for discriminator')
+    parser.add_argument('--d_lora_dropout', type=float, default=0.05, help='LoRA dropout for discriminator')
+    parser.add_argument('--d_freeze_until', type=int, default=500, help='freeze discriminator until this iteration (Step 2.6 memory optimization)')
+    parser.add_argument('--text_encoder_model', type=str, default='google/flan-t5-large', help='encoder model used to embed attribute prompts')
+    parser.add_argument('--text_max_length', type=int, default=128, help='max token length for prompt encoder')
+    parser.add_argument('--moonbeam_max_length', type=int, default=134, help='padded sequence length for discriminator input')
     
     # Training configuration.
     parser.add_argument('--dataset', type=str, default='MidiCaps', choices=['MidiCaps', 'Both'])
@@ -79,6 +117,13 @@ if __name__ == '__main__':
     parser.add_argument('--n_critic', type=int, default=5, help='number of D updates per each G update')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for Adam optimizer')
     parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam optimizer')
+    parser.add_argument('--grad_accum_steps', type=int, default=2, help='gradient accumulation steps (default 2 for memory stability)')
+    parser.add_argument('--g_weight_decay', type=float, default=0.0, help='weight decay for generator')
+    parser.add_argument('--d_weight_decay', type=float, default=0.0, help='weight decay for discriminator')
+    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='global max grad norm')
+    parser.add_argument('--g_max_grad_norm', type=float, default=1.0, help='max grad norm for generator')
+    parser.add_argument('--d_max_grad_norm', type=float, default=1.0, help='max grad norm for discriminator')
+    parser.add_argument('--use_mixed_precision', type=str2bool, default=True, help='enable autocast mixed precision')
     parser.add_argument('--resume_iters', type=int, default=None, help='resume training from this step')
     parser.add_argument('--selected_attrs', '--list', nargs='+', help='selected attributes for Music dataset',
                         default=['funk', 'celtic', 'instrumentalpop', 'ambient', 'reggae', 'popfolk', 'dance', 'rock', 'classical', 'instrumentalrock', 'folk', 'poprock', 'indie', 'hiphop', 'blues', 'experimental', 'punkrock', 'jazz', 'electronic', 'techno', 'jazzfusion', 'pop', 'alternative', 'electropop', 'soundtrack', 'trance', 'house', 'metal', 'world', 'symphonic', 'lounge', 'easylistening', 'orchestral', 'country', 'newage', 'latin', 'drumnbass', '80s', '90s', 'swing', 'chillout', 'synthpop', 'movie', 'christmas', 'heavy', 'corporate', 'action', 'romantic', 'energetic', 'background', 'children', 'calm', 'adventure', 'motivational', 'summer', 'funny', 'dramatic', 'cool', 'positive', 'emotional', 'holiday', 'deep', 'love', 'dark', 'dream', 'advertising', 'happy', 'soundscape', 'film', 'melodic', 'drama', 'uplifting', 'epic', 'ballad', 'sad', 'relaxing', 'party', 'trailer', 'inspiring', 'soft', 'slow', 'game', 'retro', 'fun', 'meditative', 'sport', 'space', 'commercial', 'documentary', 'upbeat', 'Eb major', 'B major', 'Bb major', 'F# minor', 'F# major', 'G# minor', 'A major', 'B minor', 'E minor', 'D minor', 'F minor', 'G minor', 'F major', 'Eb minor', 'C major', 'A minor', 'G major', 'D major', 'C# major', 'Bb minor', 'Ab major', 'C# minor', 'C minor', 'E major'])
