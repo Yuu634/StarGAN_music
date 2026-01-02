@@ -1,0 +1,622 @@
+"""
+StarGAN Training Script with Real Amadeus and Moonbeam Models
+Uses actual pre-trained models instead of dummy implementations
+"""
+
+import os
+import sys
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import argparse
+from tqdm import tqdm
+from pathlib import Path
+from omegaconf import OmegaConf
+import json
+import time
+import datetime
+
+# Add Amadeus and Moonbeam to path
+sys.path.append("../Amadeus")
+sys.path.append("../Moonbeam-MIDI-Foundation-Model")
+
+# Import original model classes
+from Amadeus import model_zoo
+from Amadeus.train_utils import adjust_prediction_order
+from Amadeus.evaluation_utils import wandb_style_config_to_omega_config
+from data_representation import vocab_utils
+from transformers import LlamaForSequenceClassification, LlamaConfig, T5Tokenizer, T5EncoderModel
+
+# Import loss functions
+from stargan_losses import compute_discriminator_loss, compute_generator_loss
+from data_loader import get_loader
+
+
+class StarGANTrainer:
+    """
+    StarGAN Trainer with real Amadeus Generator and Moonbeam Discriminator
+    """
+    
+    def __init__(
+        self,
+        amadeus_config_path: str,
+        amadeus_checkpoint_path: str,
+        amadeus_vocab_path: str,
+        moonbeam_config_path: str,
+        moonbeam_checkpoint_path: str,
+        num_domains: int = 108,
+        g_lr: float = 1e-4,
+        d_lr: float = 1e-4,
+        lambda_cls: float = 1.0,
+        lambda_rec: float = 10.0,
+        lambda_gp: float = 10.0,
+        n_critic: int = 5,
+        temperature: float = 0.5,
+        device: str = 'cuda'
+    ):
+        """
+        Args:
+            amadeus_config_path: Path to Amadeus config YAML
+            amadeus_checkpoint_path: Path to Amadeus checkpoint
+            amadeus_vocab_path: Path to Amadeus vocabulary
+            moonbeam_config_path: Path to Moonbeam config JSON
+            moonbeam_checkpoint_path: Path to Moonbeam checkpoint
+            num_domains: Number of domain labels (default: 108)
+            g_lr: Generator learning rate
+            d_lr: Discriminator learning rate
+            lambda_cls: Domain classification loss weight
+            lambda_rec: Cycle consistency loss weight
+            lambda_gp: Gradient penalty weight
+            n_critic: Discriminator updates per Generator update
+            temperature: Gumbel-Softmax temperature
+            device: Training device
+        """
+        self.device = device
+        self.num_domains = num_domains
+        self.lambda_cls = lambda_cls
+        self.lambda_rec = lambda_rec
+        self.lambda_gp = lambda_gp
+        self.n_critic = n_critic
+        self.temperature = temperature
+        self.vocab_path = amadeus_vocab_path  # Save vocab path for loss functions
+        
+        # Load Amadeus Generator (from model_zoo.py)
+        print("Loading Amadeus Generator...")
+        self.G, self.vocab = self._load_amadeus_model(
+            config_path=amadeus_config_path,
+            checkpoint_path=amadeus_checkpoint_path,
+            vocab_path=amadeus_vocab_path,
+            device=device
+        )
+        
+        # Load Moonbeam Discriminator (LlamaForSequenceClassification)
+        print("Loading Moonbeam Discriminator...")
+        self.D = self._load_moonbeam_model(
+            config_path=moonbeam_config_path,
+            checkpoint_path=moonbeam_checkpoint_path,
+            num_domains=num_domains,
+            device=device
+        )
+        
+        # Set to training mode
+        self.G.train()
+        self.D.train()
+        
+        # Load T5 encoder for text prompts (for teacher-forcing context)
+        print("Loading T5 Encoder for text context...")
+        self.t5_tokenizer = T5Tokenizer.from_pretrained('google/flan-t5-large')
+        self.t5_encoder = T5EncoderModel.from_pretrained('google/flan-t5-large').to(device)
+        self.t5_encoder.eval()
+        
+        # Create projection layer: sum of all vocab_sizes → Discriminator hidden_size
+        # Single layer that processes all Amadeus features at once
+        print("Creating projection layer for soft embeddings...")
+        hidden_size = self.D.config.hidden_size  # Discriminator hidden size
+        
+        # Get vocabulary sizes for each feature
+        vocab_sizes = self.vocab.get_vocab_size()
+        
+        # Amadeus features: 8 discrete token types
+        amadeus_fields = ['type', 'beat', 'chord', 'tempo', 'instrument', 'pitch', 'duration', 'velocity']
+        total_vocab_size = 0
+        vocab_size_list = []
+        
+        for feature_name in amadeus_fields:
+            if feature_name in vocab_sizes:
+                vocab_size = vocab_sizes[feature_name]
+            else:
+                # Fallback for different vocab structure
+                vocab_size = len(self.vocab.idx2event.get(feature_name, {}))
+            
+            vocab_size_list.append(vocab_size)
+            total_vocab_size += vocab_size
+        
+        print(f"  Total vocab size: {total_vocab_size} (sum of {vocab_size_list})")
+        
+        # Single projection layer: total_vocab_size → hidden_size
+        self.projection_layer = nn.Linear(total_vocab_size, hidden_size).to(device)
+        print(f"  Created projection layer: {total_vocab_size} → {hidden_size}")
+        
+        # Store vocab sizes for later use in loss functions
+        self.vocab_size_list = vocab_size_list
+        self.amadeus_fields = amadeus_fields
+        
+        # Optimizers - include projection layer in generator optimizer for better gradient flow
+        g_params = list(self.G.parameters()) + list(self.projection_layer.parameters())
+        d_params = self.D.parameters()
+        
+        self.g_optimizer = optim.Adam(g_params, lr=g_lr, betas=(0.5, 0.999))
+        self.d_optimizer = optim.Adam(d_params, lr=d_lr, betas=(0.5, 0.999))
+        
+        print("StarGAN Trainer initialized successfully!")
+        print(f"Generator parameters: {sum(p.numel() for p in self.G.parameters()):,}")
+        print(f"Discriminator parameters: {sum(p.numel() for p in self.D.parameters()):,}")
+    
+    def _load_amadeus_model(self, config_path, checkpoint_path, vocab_path, device):
+        """Load AmadeusModel from model_zoo.py"""
+        # Load config
+        config = OmegaConf.load(config_path)
+        config = wandb_style_config_to_omega_config(config)
+        nn_params = config.nn_params
+        
+        # Load vocabulary
+        encoding_scheme = nn_params.encoding_scheme
+        num_features = nn_params.num_features
+        vocab_name = {'remi':'LangTokenVocab', 'cp':'MusicTokenVocabCP', 'nb':'MusicTokenVocabNB'}
+        selected_vocab_name = vocab_name[encoding_scheme]
+        
+        vocab = getattr(vocab_utils, selected_vocab_name)(
+            in_vocab_file_path=vocab_path,
+            event_data=None,
+            encoding_scheme=encoding_scheme,
+            num_features=num_features
+        )
+        
+        # Get prediction order
+        prediction_order = adjust_prediction_order(
+            encoding_scheme, num_features, 
+            config.data_params.first_pred_feature, nn_params
+        )
+        
+        # Create AmadeusModel
+        model = getattr(model_zoo, nn_params.model_name)(
+            vocab=vocab,
+            input_length=config.train_params.input_length,
+            prediction_order=prediction_order,
+            input_embedder_name=nn_params.input_embedder_name,
+            main_decoder_name=nn_params.main_decoder_name,
+            sub_decoder_name=nn_params.sub_decoder_name,
+            sub_decoder_depth=nn_params.sub_decoder.num_layer if hasattr(nn_params, 'sub_decoder') else 0,
+            sub_decoder_enricher_use=nn_params.sub_decoder.feature_enricher_use 
+                if hasattr(nn_params, 'sub_decoder') and hasattr(nn_params.sub_decoder, 'feature_enricher_use') else False,
+            dim=nn_params.main_decoder.dim_model,
+            heads=nn_params.main_decoder.num_head,
+            depth=nn_params.main_decoder.num_layer,
+            dropout=nn_params.model_dropout,
+        )
+        
+        # Load checkpoint if provided
+        if checkpoint_path is not None:
+            ckpt = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(ckpt['model'], strict=False)
+            print(f"Loaded checkpoint from {checkpoint_path}")
+        
+        model.to(device)
+        model.train()
+        
+        print(f"Amadeus Generator loaded successfully!")
+        print(f"  Config: {config_path}")
+        print(f"  Vocab: {vocab_path}")
+        print(f"  Input length: {config.train_params.input_length}")
+        print(f"  Dim: {nn_params.main_decoder.dim_model}, Heads: {nn_params.main_decoder.num_head}, Depth: {nn_params.main_decoder.num_layer}")
+        print(f"  Encoding: {encoding_scheme}, Features: {num_features}")
+        
+        return model, vocab
+    
+    def _load_moonbeam_model(self, config_path, checkpoint_path, num_domains, device):
+        """Load LlamaForSequenceClassification (real_finetuning_player_classification.py style)"""
+        # Load config
+        llama_config = LlamaConfig.from_pretrained(config_path)
+        llama_config.use_cache = False
+        llama_config.num_labels = num_domains
+        
+        # Create model
+        model = LlamaForSequenceClassification(llama_config)
+        
+        # Load checkpoint
+        model_checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = model_checkpoint.get('model_state_dict', model_checkpoint)
+        
+        # Remove 'module.' prefix if exists
+        new_state_dict = {}
+        for k, v in checkpoint.items():
+            if k.startswith('module.'):
+                new_state_dict[k[7:]] = v
+            else:
+                new_state_dict[k] = v
+        
+        # Load state dict
+        missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
+        if missing_keys:
+            print(f"Missing keys: {missing_keys[:5]}...")  # Show first 5
+        if unexpected_keys:
+            print(f"Unexpected keys: {unexpected_keys[:5]}...")  # Show first 5
+        
+        model.to(device)
+        model.train()
+        
+        print(f"Moonbeam Discriminator loaded successfully!")
+        print(f"  Config: {config_path}")
+        print(f"  Checkpoint: {checkpoint_path}")
+        print(f"  Hidden size: {llama_config.hidden_size}")
+        print(f"  Num layers: {llama_config.num_hidden_layers}")
+        print(f"  Num classes: {llama_config.num_labels if hasattr(llama_config, 'num_labels') else num_domains}")
+        
+        return model
+    
+    def train_step(
+        self,
+        real_scores: torch.Tensor,  # [B, T, 8] Amadeus format
+        target_context: torch.Tensor,  # [B, T_text, H] Target text embedding
+        original_context: torch.Tensor,  # [B, T_text, H] Original text embedding
+        real_labels: torch.Tensor  # [B, 108] Original domain labels for discriminator loss
+    ):
+        """
+        Single training step
+        
+        Args:
+            real_scores: Real Amadeus sequences [B, T, 8]
+            target_context: Target domain text embedding context [B, T_text, H]
+            original_context: Original domain text embedding context [B, T_text, H]
+            real_labels: Original domain labels [B, 108] (for discriminator classification loss)
+            
+        Returns:
+            d_loss_val: Discriminator loss value
+            g_loss_val: Generator loss value
+            logs: Dictionary of loss components
+        """
+        B, T, _ = real_scores.shape
+        
+        # ==================== Train Discriminator ====================
+        self.d_optimizer.zero_grad()
+        
+        d_loss, d_logs = compute_discriminator_loss(
+            G=self.G,
+            D=self.D,
+            real_scores=real_scores,
+            context=target_context,
+            real_labels=real_labels,
+            projection_layer=self.projection_layer,
+            vocab_size_list=self.vocab_size_list,
+            hidden_size=self.D.config.hidden_size,
+            vocab_path=self.vocab_path,
+            lambda_cls=self.lambda_cls,
+            lambda_gp=self.lambda_gp,
+            temperature=self.temperature
+        )
+        
+        d_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.D.parameters(), max_norm=1.0)
+        self.d_optimizer.step()
+        
+        d_loss_val = d_loss.item()
+        
+        # ==================== Train Generator (every n_critic steps) ====================
+        g_loss_val = 0.0
+        g_logs = {}
+        
+        # Note: This simplified version trains G every step
+        # In full implementation, use iteration counter to train every n_critic steps
+        
+        self.g_optimizer.zero_grad()
+        
+        g_loss, g_logs, fake_tokens = compute_generator_loss(
+            G=self.G,
+            D=self.D,
+            real_scores=real_scores,
+            context=target_context,
+            original_context=original_context,
+            projection_layer=self.projection_layer,
+            vocab_size_list=self.vocab_size_list,
+            hidden_size=self.D.config.hidden_size,
+            lambda_cls=self.lambda_cls,
+            lambda_rec=self.lambda_rec,
+            temperature=self.temperature
+        )
+        
+        g_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.G.parameters(), max_norm=1.0)
+        self.g_optimizer.step()
+        
+        g_loss_val = g_loss.item()
+        
+        # Combine logs
+        logs = {**d_logs, **g_logs}
+        
+        return d_loss_val, g_loss_val, logs
+    
+    def train(
+        self,
+        dataloader: DataLoader,
+        num_iters: int = 200000,
+        save_dir: str = './checkpoints',
+        log_interval: int = 100,
+        save_interval: int = 1000
+    ):
+        """
+        Full training loop (solver.py style with iter/next)
+        
+        Args:
+            dataloader: Training data loader
+            num_iters: Number of training iterations
+            save_dir: Directory to save checkpoints
+            log_interval: Steps between logging
+            save_interval: Steps between checkpoint saves
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Initialize data iterator (solver.py style)
+        data_iter = iter(dataloader)
+        
+        print(f'Starting training for {num_iters} iterations...')
+        start_time = time.time()
+        
+        for i in range(num_iters):
+            # Fetch batch data with error handling (solver.py style)
+            try:
+                score, label = next(data_iter)
+            except StopIteration:
+                # Restart iterator when epoch ends
+                data_iter = iter(dataloader)
+                score, label = next(data_iter)
+            except FileNotFoundError as e:
+                #print(f"\n[Warning] FileNotFoundError at iteration {i}: {e}")
+                print(f"Skipping this batch and continuing...")
+                continue
+            except Exception as e:
+                #print(f"\n[Warning] Error at iteration {i}: {type(e).__name__}: {e}")
+                continue
+            
+            # Extract batch data
+            real_scores = score.to(self.device)  # [B, T, 8]
+            original_labels = label.to(self.device)  # [B, 108]
+            
+            if real_scores.shape[1] > 3072:
+                print("Skipping batch with sequence length > Amadeus max input length (3072)...")
+                continue
+            
+            # Generate text prompts for original and target domains
+            # For simplicity, use domain indices as text prompts
+            B = original_labels.size(0)
+            
+            # Get original domain index (first domain with label=1, since labels are multi-hot binary)
+            original_domain_idx = torch.where(original_labels == 1)[1]  # [B]
+            
+            # Generate random target domain (different from original)
+            target_domain_idx = torch.randint(0, self.num_domains, (B,), device=self.device)
+            
+            # Create simple text prompts from domain indices
+            original_prompts = [f"Domain {idx.item()}" for idx in original_domain_idx]
+            target_prompts = [f"Domain {idx.item()}" for idx in target_domain_idx]
+            
+            # Encode prompts with T5 (keep tokenizer output as context)
+            # Original context
+            original_input = self.t5_tokenizer(
+                original_prompts,
+                return_tensors='pt',
+                padding='max_length',
+                truncation=True,
+                max_length=128
+            ).to(self.device)
+            # original_input: {'input_ids': [B, 128], 'attention_mask': [B, 128]}
+            original_context = dict(original_input)  # Keep as dict for Amadeus context
+            
+            # Target context
+            target_input = self.t5_tokenizer(
+                target_prompts,
+                return_tensors='pt',
+                padding='max_length',
+                truncation=True,
+                max_length=128
+            ).to(self.device)
+            # target_input: {'input_ids': [B, 128], 'attention_mask': [B, 128]}
+            target_context = dict(target_input)  # Keep as dict for Amadeus context
+            
+            # Training step
+            d_loss, g_loss, logs = self.train_step(
+                real_scores=real_scores,
+                target_context=target_context,
+                original_context=original_context,
+                real_labels=original_labels
+            )
+            
+            # Logging
+            if (i + 1) % log_interval == 0:
+                elapsed = time.time() - start_time
+                elapsed_str = str(datetime.timedelta(seconds=int(elapsed)))
+                log_str = f"Elapsed [{elapsed_str}], Iteration [{i+1}/{num_iters}], "
+                log_str += ", ".join([f"{k}: {v:.4f}" for k, v in logs.items()])
+                print(log_str)
+            
+            # Save checkpoint
+            if (i + 1) % save_interval == 0:
+                epoch = i // len(dataloader)
+                self.save_checkpoint(
+                    save_dir=save_dir,
+                    epoch=epoch,
+                    step=i + 1
+                )
+        
+        # Final checkpoint
+        final_epoch = num_iters // len(dataloader)
+        self.save_checkpoint(save_dir=save_dir, epoch=final_epoch, step=num_iters)
+        print(f"Training completed! Final checkpoint saved to {save_dir}")
+    
+    def save_checkpoint(self, save_dir: str, epoch: int, step: int):
+        """Save model checkpoint"""
+        checkpoint_path = os.path.join(save_dir, f'stargan_epoch{epoch}_step{step}.pt')
+        
+        checkpoint = {
+            'epoch': epoch,
+            'step': step,
+            'generator_state_dict': self.G.state_dict(),
+            'discriminator_state_dict': self.D.state_dict(),
+            'g_optimizer_state_dict': self.g_optimizer.state_dict(),
+            'd_optimizer_state_dict': self.d_optimizer.state_dict()
+        }
+        
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Checkpoint saved to {checkpoint_path}")
+    
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load model checkpoint"""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        self.G.load_state_dict(checkpoint['generator_state_dict'])
+        self.D.load_state_dict(checkpoint['discriminator_state_dict'])
+        self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state_dict'])
+        self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state_dict'])
+        
+        epoch = checkpoint['epoch']
+        step = checkpoint['step']
+        
+        print(f"Loaded checkpoint from {checkpoint_path} (Epoch {epoch}, Step {step})")
+        return epoch, step
+
+
+def main():
+    parser = argparse.ArgumentParser(description='StarGAN Training with Real Models')
+    
+    # Model paths (from main.py)
+    parser.add_argument('--g_modelpath', type=str, default="../Amadeus/models/Amadeus-S/files/config.yaml", 
+                       help='path to the generator config yaml')
+    parser.add_argument('--amadeus_checkpoint', type=str, default="../Amadeus/models/Amadeus-S/files/checkpoints/iter103662_loss-0.2098.pt",
+                       help='Path to Amadeus checkpoint (optional)')
+    parser.add_argument('--d_modelpath', type=str, default="../Moonbeam-MIDI-Foundation-Model/models/pretrained/moonbeam_309M.pt", 
+                       help='path to the discriminator model')
+    parser.add_argument('--d_configpath', type=str, default="../Moonbeam-MIDI-Foundation-Model/src/llama_recipes/configs/player_classification_config_small.json", 
+                       help='path to the discriminator config')
+    
+    # Training hyperparameters (from main.py)
+    parser.add_argument('--batch_size', type=int, default=1, help='mini-batch size')
+    parser.add_argument('--num_iters', type=int, default=200000, help='number of total iterations for training D')
+    parser.add_argument('--num_iters_decay', type=int, default=100000, help='number of iterations for decaying lr')
+    parser.add_argument('--g_lr', type=float, default=0.0001, help='learning rate for G')
+    parser.add_argument('--d_lr', type=float, default=0.0001, help='learning rate for D')
+    parser.add_argument('--lambda_cls', type=float, default=1, help='weight for domain classification loss')
+    parser.add_argument('--lambda_rec', type=float, default=10, help='weight for reconstruction loss')
+    parser.add_argument('--lambda_gp', type=float, default=10, help='weight for gradient penalty')
+    parser.add_argument('--n_critic', type=int, default=5, help='number of D updates per each G update')
+    parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for Adam optimizer')
+    parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam optimizer')
+    parser.add_argument('--temperature', type=float, default=1.15, help='temperature for sampling method')
+    parser.add_argument('--resume_iters', type=int, default=None, help='resume training from this step')
+    
+    # Data and I/O (from main.py)
+    parser.add_argument('--score_dir', type=str, default='../Amadeus/dataset/MidiCaps/corpus/tuneidx_', help='Training data directory')
+    parser.add_argument('--attr_path', type=str, default='../Dataset/MidiCaps/train.json', help='Attribute path')
+    parser.add_argument('--vocab_path', type=str, default='../Amadeus/models/Amadeus-S/files/checkpoints/vocab_LakhALLFined_nb8.json', help='Vocabulary path')
+    parser.add_argument('--model_save_dir', type=str, default='stargan/models', help='Checkpoint save directory')
+    parser.add_argument('--log_dir', type=str, default='stargan/logs', help='Log directory')
+    parser.add_argument('--sample_dir', type=str, default='stargan/samples', help='Sample directory')
+    parser.add_argument('--result_dir', type=str, default='stargan/results', help='Result directory')
+    parser.add_argument('--encoding', type=str, default='nb8', help='Encoding type')
+    parser.add_argument('--dataset', type=str, default='MidiCaps', help='Dataset name')
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'], help='Mode')
+    parser.add_argument('--num_workers', type=int, default=1, help='Number of workers')
+    parser.add_argument('--device', type=str, default='cuda', help='Training device')
+    
+    # Step sizes (from main.py)
+    parser.add_argument('--log_step', type=int, default=10, help='Log step interval')
+    parser.add_argument('--sample_step', type=int, default=1000, help='Sample step interval')
+    parser.add_argument('--model_save_step', type=int, default=10000, help='Model save step interval')
+    parser.add_argument('--lr_update_step', type=int, default=1000, help='Learning rate update step')
+    
+    # Generator configuration (from main.py)
+    parser.add_argument('--generate_length', type=int, default=100, help='length of the generated sequence')
+    parser.add_argument('--sampling_method', type=str, choices=('top_p', 'top_k'), default="top_k", help='sampling method for generation')
+    parser.add_argument('--threshold', type=float, default=0.99, help='threshold for sampling method')
+    
+    # Domain labels (from main.py)
+    parser.add_argument('--selected_attrs', '--list', nargs='+', help='selected attributes for Music dataset',
+                        default=['funk', 'celtic', 'instrumentalpop', 'ambient', 'reggae', 'popfolk', 'dance', 'rock', 'classical', 'instrumentalrock', 'folk', 'poprock', 'indie', 'hiphop', 'blues', 'experimental', 'punkrock', 'jazz', 'electronic', 'techno', 'jazzfusion', 'pop', 'alternative', 'electropop', 'soundtrack', 'trance', 'house', 'metal', 'world', 'symphonic', 'lounge', 'easylistening', 'orchestral', 'country', 'newage', 'latin', 'drumnbass', '80s', '90s', 'swing', 'chillout', 'synthpop', 'movie', 'christmas', 'heavy', 'corporate', 'action', 'romantic', 'energetic', 'background', 'children', 'calm', 'adventure', 'motivational', 'summer', 'funny', 'dramatic', 'cool', 'positive', 'emotional', 'holiday', 'deep', 'love', 'dark', 'dream', 'advertising', 'happy', 'soundscape', 'film', 'melodic', 'drama', 'uplifting', 'epic', 'ballad', 'sad', 'relaxing', 'party', 'trailer', 'inspiring', 'soft', 'slow', 'game', 'retro', 'fun', 'meditative', 'sport', 'space', 'commercial', 'documentary', 'upbeat', 'Eb major', 'B major', 'Bb major', 'F# minor', 'F# major', 'G# minor', 'A major', 'B minor', 'E minor', 'D minor', 'F minor', 'G minor', 'F major', 'Eb minor', 'C major', 'A minor', 'G major', 'D major', 'C# major', 'Bb minor', 'Ab major', 'C# minor', 'C minor', 'E major'])
+    
+    args = parser.parse_args()
+    
+    # Create directories if not exist
+    os.makedirs(args.log_dir, exist_ok=True)
+    os.makedirs(args.model_save_dir, exist_ok=True)
+    os.makedirs(args.sample_dir, exist_ok=True)
+    os.makedirs(args.result_dir, exist_ok=True)
+    
+    # Create trainer
+    trainer = StarGANTrainer(
+        amadeus_config_path=args.g_modelpath,  # Use g_modelpath as config path
+        amadeus_checkpoint_path=args.amadeus_checkpoint,
+        amadeus_vocab_path=args.vocab_path,  # Pass vocab_path
+        moonbeam_config_path=args.d_configpath,
+        moonbeam_checkpoint_path=args.d_modelpath,  # Use d_modelpath as checkpoint
+        num_domains=len(args.selected_attrs),  # Number of domains from selected_attrs
+        g_lr=args.g_lr,
+        d_lr=args.d_lr,
+        lambda_cls=args.lambda_cls,
+        lambda_rec=args.lambda_rec,
+        lambda_gp=args.lambda_gp,
+        n_critic=args.n_critic,
+        temperature=args.temperature,
+        device=args.device
+    )
+    
+    print(f"Configuration:")
+    print(f"  Generator model: {args.g_modelpath}")
+    print(f"  Discriminator model: {args.d_modelpath}")
+    print(f"  Discriminator config: {args.d_configpath}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Number of iterations: {args.num_iters}")
+    print(f"  Generator LR: {args.g_lr}")
+    print(f"  Discriminator LR: {args.d_lr}")
+    print(f"  Number of domains: {len(args.selected_attrs)}")
+    print(f"  Score directory: {args.score_dir}")
+    print(f"  Attribute path: {args.attr_path}")
+    print(f"  Model save directory: {args.model_save_dir}")
+    
+    # Create dataloader from args.score_dir and args.attr_path
+    print("\nCreating dataloader...")
+    print(f"  Score directory: {args.score_dir}")
+    print(f"  Attribute path: {args.attr_path}")
+    print(f"  Vocabulary: {args.vocab_path}")
+    print(f"  Encoding: {args.encoding}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Mode: {args.mode}")
+    print(f"  Num workers: {args.num_workers}")
+    
+    dataloader = get_loader(
+        score_dir=args.score_dir,
+        encoding=args.encoding,
+        attr_path=args.attr_path,
+        selected_attrs=args.selected_attrs,
+        batch_size=args.batch_size,
+        dataset=args.dataset,
+        mode=args.mode,
+        num_workers=args.num_workers
+    )
+    
+    print(f"Dataloader created successfully!")
+    print(f"  Number of batches: {len(dataloader)}")
+    
+    # Start training with num_iters (not num_epochs)
+    print(f"  Training iterations: {args.num_iters}")
+    
+    # Start training
+    trainer.train(
+        dataloader=dataloader,
+        num_iters=args.num_iters,
+        save_dir=args.model_save_dir,
+        log_interval=args.log_step,
+        save_interval=args.model_save_step
+    )
+
+
+if __name__ == '__main__':
+    main()

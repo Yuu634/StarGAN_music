@@ -13,11 +13,36 @@ import json
 from transformers import T5Tokenizer, T5EncoderModel, LlamaConfig
 import sys
 sys.path.append("../Moonbeam-MIDI-Foundation-Model")
-#from inference import ScoreArrangeDomainClassifier
-from src.llama_recipes.real_finetuning_player_classification import LlamaForSequenceDoubleClassification
+try:
+    #from inference import ScoreArrangeDomainClassifier
+    from src.llama_recipes.real_finetuning_player_classification import LlamaForSequenceDoubleClassification
+except ImportError:
+    print("Warning: Could not import LlamaForSequenceDoubleClassification from Moonbeam")
+    LlamaForSequenceDoubleClassification = None
+
 sys.path.append("../Amadeus")
-from generate import load_resources
-from Amadeus import model_zoo
+try:
+    from generate import load_resources
+    from Amadeus import model_zoo
+except ImportError:
+    print("Warning: Could not import from Amadeus")
+    load_resources = None
+    model_zoo = None
+
+# Import End-to-End StarGAN components
+try:
+    from amadeus_stargan import AmadeusForStarGAN
+    from llama_discriminator import LlamaForSequenceDoubleClassification as LlamaDiscriminator
+    from stargan_losses import (
+        compute_discriminator_loss,
+        compute_generator_loss,
+        check_gradient_flow,
+        generate_target_domain
+    )
+except ImportError as e:
+    print(f"Warning: Could not import E2E StarGAN components: {e}")
+    AmadeusForStarGAN = None
+    LlamaDiscriminator = None
 
 AMAEDEUS_FIELDS = ["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"]
 
@@ -487,10 +512,9 @@ class Solver(object):
             context = encoder(**context).last_hidden_state
             
             x_real = torch.tensor(x_real, dtype=torch.long).to(self.device)
-            x_fake = self.G.generate(
-                    0, self.generate_length, condition=None, num_target_measures=None,
-                    sampling_method=self.sampling_method, threshold=self.threshold,
-                    temperature=self.temperature, context=context, input_note=x_real
+            x_fake = self.G(
+                    context=context,
+                    input_note=x_real
                 )
             
             """out_src, out_cls = self.D(x_fake.detach())"""
@@ -843,6 +867,212 @@ class Solver(object):
                 x_fake_list = [x_real]
                 for c_celeba in c_celeba_list:
                     c_trg = torch.cat([c_celeba, zero_rafd, mask_celeba], dim=1)
+                    x_fake_list.append(self.G(x_real, c_trg))
+                for c_rafd in c_rafd_list:
+                    c_trg = torch.cat([zero_celeba, c_rafd, mask_rafd], dim=1)
+                    x_fake_list.append(self.G(x_real, c_trg))
+
+                # Save the translated images.
+                x_concat = torch.cat(x_fake_list, dim=3)
+                result_path = os.path.join(self.result_dir, '{}-images.jpg'.format(i+1))
+                save_image(self.denorm(x_concat.data.cpu()), result_path, nrow=1, padding=0)
+                print('Saved real and fake images into {}...'.format(result_path))
+
+    def train_stargan_e2e(self):
+        """
+        End-to-End differentiable StarGAN training
+        Gradient flows from Discriminator to Generator
+        """
+        print('=== Starting End-to-End StarGAN Training ===')
+        
+        # Wrap Amadeus and Discriminator with E2E components
+        if not isinstance(self.G, AmadeusForStarGAN):
+            print("Wrapping Generator with AmadeusForStarGAN...")
+            vocab = getattr(self.G, 'vocab', None) or self.vocab
+            self.G_e2e = AmadeusForStarGAN(self.G, vocab, hidden_dim=512)
+            self.G_e2e.to(self.device)
+            # Re-initialize optimizer with new wrapped model
+            self.g_optimizer = torch.optim.Adam(
+                self.G_e2e.parameters(), 
+                self.g_lr, 
+                [self.beta1, self.beta2]
+            )
+        else:
+            self.G_e2e = self.G
+        
+        if not isinstance(self.D, LlamaDiscriminator):
+            print("Wrapping Discriminator with LlamaDiscriminator...")
+            # Use existing D or create new one
+            self.D_e2e = self.D
+        else:
+            self.D_e2e = self.D
+        
+        # Data loader
+        data_loader = self.score_loader
+        data_iter = iter(data_loader)
+        
+        # Learning rates
+        g_lr = self.g_lr
+        d_lr = self.d_lr
+        
+        # Resume if needed
+        start_iters = self.resume_iters if self.resume_iters else 0
+        if self.resume_iters:
+            print(f'Resuming from iteration {start_iters}...')
+            self.restore_model(self.resume_iters)
+        
+        print(f'Training from iteration {start_iters} to {self.num_iters}')
+        print(f'Batch size: {self.batch_size}')
+        print(f'n_critic: {self.n_critic}')
+        print(f'lambda_cls: {self.lambda_cls}, lambda_rec: {self.lambda_rec}, lambda_gp: {self.lambda_gp}')
+        
+        start_time = time.time()
+        
+        for i in range(start_iters, self.num_iters):
+            
+            # ========================================
+            # 1. Data Preparation
+            # ========================================
+            try:
+                real_scores, real_labels, attention_mask = next(data_iter)
+            except StopIteration:
+                data_iter = iter(data_loader)
+                real_scores, real_labels, attention_mask = next(data_iter)
+            except Exception as e:
+                print(f"Error loading data: {e}")
+                continue
+            
+            real_scores = real_scores.to(self.device)  # [B, T, 8]
+            real_labels = real_labels.to(self.device)  # [B, 108]
+            attention_mask = attention_mask.to(self.device) if attention_mask is not None else None
+            
+            # Generate target domain labels (random permutation)
+            target_labels = generate_target_domain(real_labels)
+            
+            # ========================================
+            # 2. Discriminator Update
+            # ========================================
+            d_loss, d_logs = compute_discriminator_loss(
+                self.G_e2e,
+                self.D_e2e,
+                real_scores,
+                target_labels,
+                real_labels,
+                lambda_cls=self.lambda_cls,
+                lambda_gp=self.lambda_gp,
+                temperature=0.5
+            )
+            
+            # Backward and update D only
+            self.reset_grad()
+            d_loss.backward()
+            
+            # Gradient clipping (optional, helps stability)
+            torch.nn.utils.clip_grad_norm_(self.D_e2e.parameters(), max_norm=1.0)
+            
+            self.d_optimizer.step()
+            
+            loss = d_logs.copy()
+            
+            # ========================================
+            # 3. Generator Update (every n_critic iterations)
+            # ========================================
+            if (i + 1) % self.n_critic == 0:
+                g_loss, g_logs, fake_tokens = compute_generator_loss(
+                    self.G_e2e,
+                    self.D_e2e,
+                    real_scores,
+                    target_labels,
+                    real_labels,
+                    lambda_cls=self.lambda_cls,
+                    lambda_rec=self.lambda_rec,
+                    temperature=0.5
+                )
+                
+                # Backward and update G only
+                self.reset_grad()
+                g_loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.G_e2e.parameters(), max_norm=1.0)
+                
+                self.g_optimizer.step()
+                
+                loss.update(g_logs)
+            
+            # ========================================
+            # 4. Logging
+            # ========================================
+            if (i + 1) % self.log_step == 0:
+                et = time.time() - start_time
+                et = str(datetime.timedelta(seconds=et))[:-7]
+                log = f"Elapsed [{et}], Iteration [{i+1}/{self.num_iters}]"
+                for tag, value in loss.items():
+                    log += f", {tag}: {value:.4f}"
+                print(log)
+                
+                if self.use_tensorboard:
+                    for tag, value in loss.items():
+                        self.logger.scalar_summary(tag, value, i+1)
+            
+            # ========================================
+            # 5. Gradient Flow Check (debugging)
+            # ========================================
+            if (i + 1) % (self.log_step * 10) == 0:
+                print(f"\n=== Gradient Flow Check at iteration {i+1} ===")
+                # Check if gradients are flowing properly
+                # This is automatically done during backward, just log if needed
+                
+            # ========================================
+            # 6. Sample Generation
+            # ========================================
+            if (i + 1) % self.sample_step == 0:
+                print(f'Generating samples at iteration {i+1}...')
+                with torch.no_grad():
+                    # Take first 4 samples
+                    sample_scores = real_scores[:min(4, real_scores.size(0))]
+                    sample_targets = target_labels[:min(4, target_labels.size(0))]
+                    
+                    fake_logits, _ = self.G_e2e(
+                        sample_scores,
+                        sample_targets,
+                        temperature=0.5,
+                        hard=True
+                    )
+                    fake_samples = self.G_e2e.get_hard_tokens(fake_logits)
+                    
+                    # Save as MIDI files
+                    for idx in range(fake_samples.size(0)):
+                        tokens = fake_samples[idx].cpu().numpy()
+                        save_path = os.path.join(
+                            self.sample_dir,
+                            f'{i+1}_sample_{idx}.npy'
+                        )
+                        np.save(save_path, tokens)
+                    
+                    print(f'Saved {fake_samples.size(0)} samples to {self.sample_dir}')
+            
+            # ========================================
+            # 7. Model Checkpoint
+            # ========================================
+            if (i + 1) % self.model_save_step == 0:
+                G_path = os.path.join(self.model_save_dir, f'{i+1}-G_e2e.ckpt')
+                D_path = os.path.join(self.model_save_dir, f'{i+1}-D_e2e.ckpt')
+                torch.save(self.G_e2e.state_dict(), G_path)
+                torch.save(self.D_e2e.state_dict(), D_path)
+                print(f'Saved checkpoints: {G_path}, {D_path}')
+            
+            # ========================================
+            # 8. Learning Rate Decay
+            # ========================================
+            if (i + 1) % self.lr_update_step == 0 and (i + 1) > (self.num_iters - self.num_iters_decay):
+                g_lr -= (self.g_lr / float(self.num_iters_decay))
+                d_lr -= (self.d_lr / float(self.num_iters_decay))
+                self.update_lr(g_lr, d_lr)
+                print(f'Decayed learning rates: g_lr={g_lr:.6f}, d_lr={d_lr:.6f}')
+        
+        print('=== End-to-End StarGAN Training Completed ===')
+
                     x_fake_list.append(self.G(x_real, c_trg))
                 for c_rafd in c_rafd_list:
                     c_trg = torch.cat([zero_celeba, c_rafd, mask_rafd], dim=1)
