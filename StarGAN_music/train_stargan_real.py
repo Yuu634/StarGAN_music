@@ -83,7 +83,7 @@ class StarGANTrainer:
         
         # Load Amadeus Generator (from model_zoo.py)
         print("Loading Amadeus Generator...")
-        self.G, self.vocab = self._load_amadeus_model(
+        self.G, self.vocab, self.nn_params = self._load_amadeus_model(
             config_path=amadeus_config_path,
             checkpoint_path=amadeus_checkpoint_path,
             vocab_path=amadeus_vocab_path,
@@ -142,8 +142,22 @@ class StarGANTrainer:
         self.vocab_size_list = vocab_size_list
         self.amadeus_fields = amadeus_fields
         
-        # Optimizers - include projection layer in generator optimizer for better gradient flow
-        g_params = list(self.G.parameters()) + list(self.projection_layer.parameters())
+        # Create embedding layers for logits_to_embedded_input function
+        # Reference: MultiEmbedding._make_emb_layers() from transformer_utils.py
+        print("Creating embedding layers for soft embedding conversion...")
+        self.embedding_layers = []
+        emb_size = self.nn_params.main_decoder.dim_model  # Use same embedding size as Amadeus model
+        
+        for vocab_size in vocab_size_list:
+            if emb_size != 0:
+                self.embedding_layers.append(nn.Embedding(vocab_size, emb_size).to(device))
+        
+        self.embedding_layers = nn.ModuleList(self.embedding_layers)
+        self.emb_size = emb_size
+        print(f"  Created {len(self.embedding_layers)} embedding layers with size {emb_size}")
+        
+        # Optimizers - include projection layer and embedding layers in generator optimizer for better gradient flow
+        g_params = list(self.G.parameters()) + list(self.projection_layer.parameters()) + list(self.embedding_layers.parameters())
         d_params = self.D.parameters()
         
         self.g_optimizer = optim.Adam(g_params, lr=g_lr, betas=(0.5, 0.999))
@@ -212,7 +226,7 @@ class StarGANTrainer:
         print(f"  Dim: {nn_params.main_decoder.dim_model}, Heads: {nn_params.main_decoder.num_head}, Depth: {nn_params.main_decoder.num_layer}")
         print(f"  Encoding: {encoding_scheme}, Features: {num_features}")
         
-        return model, vocab
+        return model, vocab, nn_params
     
     def _load_moonbeam_model(self, config_path, checkpoint_path, num_domains, device):
         """Load LlamaForSequenceClassification (real_finetuning_player_classification.py style)"""
@@ -311,7 +325,7 @@ class StarGANTrainer:
         
         self.g_optimizer.zero_grad()
         
-        g_loss, g_logs, fake_tokens = compute_generator_loss(
+        g_loss, g_logs = compute_generator_loss(
             G=self.G,
             D=self.D,
             real_scores=real_scores,
@@ -320,6 +334,8 @@ class StarGANTrainer:
             projection_layer=self.projection_layer,
             vocab_size_list=self.vocab_size_list,
             hidden_size=self.D.config.hidden_size,
+            embedding_layers=self.embedding_layers,
+            emb_size=self.emb_size,
             lambda_cls=self.lambda_cls,
             lambda_rec=self.lambda_rec,
             temperature=self.temperature

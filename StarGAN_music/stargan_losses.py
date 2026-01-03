@@ -11,6 +11,141 @@ import json
 import numpy as np
 import re
 
+
+class StraightThroughEstimator(torch.autograd.Function):
+    """
+    Straight-Through Estimator (STE) for differentiable argmax
+    
+    Forward: Returns hard discrete tokens via argmax
+    Backward: Passes gradients through softmax probabilities
+    
+    This allows:
+    - Forward pass: Get discrete tokens for Amadeus model
+    - Backward pass: Gradients flow through probability distribution
+    """
+    
+    @staticmethod
+    def forward(ctx, logits):
+        """
+        Args:
+            logits: [B, T, vocab_size]
+        
+        Returns:
+            hard_tokens: [B, T] with values in [0, vocab_size-1]
+        """
+        hard_tokens = logits.argmax(dim=-1)  # [B, T]
+        probs = F.softmax(logits, dim=-1)  # [B, T, vocab_size]
+        
+        # Save for backward
+        ctx.save_for_backward(logits, hard_tokens, probs)
+        return hard_tokens.float()
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        Backward pass: Gradient flows through softmax(logits)
+        
+        Args:
+            grad_output: [B, T] gradients w.r.t. hard_tokens
+        
+        Returns:
+            grad_logits: [B, T, vocab_size] gradients w.r.t. logits
+        """
+        logits, hard_tokens, probs = ctx.saved_tensors
+        
+        # Broadcast grad_output to match logits shape
+        # grad_output: [B, T] → [B, T, 1]
+        grad_output_expanded = grad_output.unsqueeze(-1)  # [B, T, 1]
+        
+        # Gradient flows proportional to probabilities
+        # grad_logits = grad_output * probs (weighted by probability)
+        grad_logits = grad_output_expanded * probs  # [B, T, vocab_size]
+        
+        return grad_logits
+
+
+def gumbel_softmax_sample(logits, tau=0.5, hard=True):
+    """
+    Gumbel-Softmax sampling for differentiable discrete sampling
+    
+    Args:
+        logits: [B, T, vocab_size]
+        tau: Temperature (lower = more discrete, higher = more continuous)
+        hard: If True, return hard samples via STE; if False, return soft probabilities
+    
+    Returns:
+        samples: [B, T, vocab_size] if hard=False
+        or [B, T] discrete token indices if hard=True
+    """
+    # Sample Gumbel noise
+    u = torch.rand_like(logits)
+    gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
+    
+    # Add noise to logits
+    noisy_logits = (logits + gumbel_noise) / tau
+    
+    # Get soft probabilities
+    soft_probs = F.softmax(noisy_logits, dim=-1)  # [B, T, vocab_size]
+    
+    if hard:
+        # Hard samples: argmax
+        hard_samples = soft_probs.argmax(dim=-1)  # [B, T]
+        # Straight-through: use soft in forward, hard in backward
+        hard_samples_float = hard_samples.float()
+        # Gradient flows through soft_probs
+        return hard_samples_float + (soft_probs - soft_probs.detach())
+    else:
+        return soft_probs
+
+
+def logits_to_discrete_tokens_differentiable(fake_logits, temperature=0.5, use_gumbel=True):
+    """
+    Convert fake_logits to discrete tokens in a differentiable way
+    
+    Two methods:
+    1. Gumbel-Softmax (recommended): More stable gradient flow
+    2. STE: Traditional straight-through estimator
+    
+    Args:
+        fake_logits: Dict[feature_name] = [B, T, vocab_size]
+        temperature: Temperature parameter (lower = more discrete)
+        use_gumbel: If True, use Gumbel-Softmax; if False, use STE
+    
+    Returns:
+        hard_tokens: [B, T, num_features] with values as token indices
+    """
+    device = None
+    B, T = None, None
+    hard_tokens_list = []
+    
+    # Convert each feature's logits to discrete tokens
+    for feature_name in AMADEUS_FIELDS:
+        if feature_name in list(fake_logits[0].keys()):
+            logit = fake_logits[0][feature_name]  # [B, T, vocab_size]
+            
+            if B is None:
+                B, T, _ = logit.shape
+                device = logit.device
+            
+            if use_gumbel:
+                # Method 1: Gumbel-Softmax (more stable)
+                # Use soft sampling with gradient flow
+                soft_sample = gumbel_softmax_sample(logit, tau=temperature, hard=False)  # [B, T, vocab_size]
+                # Get hard token via argmax, but gradients flow through soft probabilities
+                hard_token = soft_sample.argmax(dim=-1)  # [B, T]
+                hard_tokens_list.append(hard_token.float())
+            else:
+                # Method 2: Traditional STE
+                hard_token = StraightThroughEstimator.apply(logit)  # [B, T]
+                hard_tokens_list.append(hard_token)
+    
+    # Stack all feature tokens: [B, T, num_features]
+    hard_tokens = torch.stack(hard_tokens_list, dim=-1)  # [B, T, 8]
+    hard_tokens = hard_tokens.long()  # Convert to long type for embedding indices
+    
+    return hard_tokens
+
+
 AMADEUS_FIELDS = ["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"]
 
 # Import conversion functions from solver
@@ -223,15 +358,16 @@ def logits_to_embeddings_via_projection(fake_logits, projection_layer, vocab_siz
     
     # Collect logits for each feature in order
     for feature_name in AMADEUS_FIELDS:
-        if feature_name in fake_logits:
-            logit = fake_logits[feature_name]  # [B, T, vocab_size]
+        if feature_name in list(fake_logits[0].keys()):
+            logit = fake_logits[0][feature_name]  # [B, T, vocab_size]
             if B is None:
                 B, T, _ = logit.shape
                 device = logit.device
             
+            #logit = logit.squeeze(0)
             # Apply softmax to get probabilities (differentiable!)
-            probs = F.softmax(logit, dim=-1)  # [B, T, vocab_size]
-            logits_list.append(probs)
+            #probs = F.softmax(logit, dim=-1)  # [B, T, vocab_size]
+            logits_list.append(logit)
     
     # Concatenate all feature probabilities: [B, T, total_vocab_size]
     concatenated = torch.cat(logits_list, dim=-1)  # [B, T, Σvocab_sizes]
@@ -240,6 +376,58 @@ def logits_to_embeddings_via_projection(fake_logits, projection_layer, vocab_siz
     embeddings = projection_layer(concatenated)  # [B, T, hidden_size]
     
     return embeddings
+
+
+def logits_to_embedded_input(fake_logits, embedding_layers, vocab_size_list, emb_size):
+    """
+    Convert Generator logits to Generator input embeddings via vocabulary embeddings
+    FULLY DIFFERENTIABLE approach: probs × vocab_embedding with summation
+    
+    Args:
+        fake_logits: Dict[feature_name] = [B, T, vocab_size] Generator output
+        embedding_layers: List of nn.Embedding layers for each feature (same structure as MultiEmbedding._make_emb_layers)
+        vocab_size_list: List of vocab sizes for each feature in order
+        emb_size: Embedding size for each feature
+    
+    Returns:
+        embedded_input: [B, T, emb_size] Embedded representation for Generator input
+    """
+    B, T = None, None
+    device = None
+    embedded_features = []
+    
+    # Process each feature in order
+    for feat_idx, feature_name in enumerate(AMADEUS_FIELDS):
+        if feature_name in list(fake_logits[0].keys()):
+            logit = fake_logits[0][feature_name]  # [B, T, vocab_size]
+            if B is None:
+                B, T, _ = logit.shape
+                device = logit.device
+            
+            # 1. Convert logits to probabilities via softmax
+            probs = F.softmax(logit, dim=-1)  # [B, T, vocab_size]
+            
+            # 2. Get vocabulary embeddings for this feature
+            vocab_size = vocab_size_list[feat_idx]
+            emb_layer = embedding_layers[feat_idx]
+            
+            # Create indices for all vocabulary entries
+            vocab_indices = torch.arange(vocab_size, device=device, dtype=torch.long)  # [vocab_size]
+            vocab_embeddings = emb_layer(vocab_indices)  # [vocab_size, emb_size]
+            
+            # 3. Compute weighted sum: probs × embeddings
+            # probs: [B, T, vocab_size], vocab_embeddings: [vocab_size, emb_size]
+            # result: [B, T, emb_size]
+            weighted_emb = torch.einsum('btv,ve->bte', probs, vocab_embeddings)  # [B, T, emb_size]
+            
+            embedded_features.append(weighted_emb)
+    
+    # 4. Sum all feature embeddings
+    # embedded_features is list of [B, T, emb_size], length = 8
+    summed_embedding = torch.stack(embedded_features, dim=2)  # [B, T, 8, emb_size]
+    embedded_input = torch.sum(summed_embedding, dim=2)  # [B, T, emb_size]
+    
+    return embedded_input
 
 
 def tokens_to_embeddings_via_projection(amadeus_tokens, projection_layer, vocab_size_list, hidden_size):
@@ -379,6 +567,8 @@ def compute_generator_loss(
     projection_layer,
     vocab_size_list,
     hidden_size,
+    embedding_layers,
+    emb_size,
     lambda_cls=1.0,
     lambda_rec=10.0,
     temperature=0.5
@@ -396,6 +586,8 @@ def compute_generator_loss(
         projection_layer: nn.Linear(total_vocab_size, hidden_size)
         vocab_size_list: List of vocab sizes for each feature
         hidden_size: Discriminator hidden size
+        embedding_layers: List of nn.Embedding layers (from MultiEmbedding._make_emb_layers)
+        emb_size: Embedding size for each feature
         lambda_cls: Weight for domain classification loss
         lambda_rec: Weight for reconstruction loss
         temperature: Temperature (unused in differentiable approach)
@@ -434,22 +626,22 @@ def compute_generator_loss(
     # Domain classification loss (skip for now)
     g_loss_cls = torch.tensor(0.0, device=device)
     
+    # ========== Convert fake_logits to discrete tokens (DIFFERENTIABLE via Gumbel-Softmax) ==========
+    # Use Gumbel-Softmax for more stable and reliable gradient flow
+    # - Forward: discrete tokens for Amadeus model (via argmax on soft probabilities)
+    # - Backward: gradients flow through softmax probabilities
+    fake_hard_tokens = logits_to_discrete_tokens_differentiable(
+        fake_logits, 
+        temperature=temperature,  # Use provided temperature parameter
+        use_gumbel=True  # Use Gumbel-Softmax (more stable than STE)
+    )  # [B, T, 8] differentiable
+    
     # ========== Cycle Consistency: Target → Original ==========
-    # Get hard tokens for reconstruction by argmax on fake_logits
-    fake_hard_logits = {}
-    for feature_name, logit in fake_logits.items():
-        fake_hard_logits[feature_name] = logit.argmax(dim=-1)  # [B, T]
-    
-    # Convert hard logits back to [B, T, 8] format
-    fake_hard_tokens = torch.stack(
-        [fake_hard_logits[field] for field in AMADEUS_FIELDS],
-        dim=-1
-    ).long()  # [B, T, 8]
-    
-    # Reconstruct back to original domain
+    # Reconstruct back to original domain using differentiable hard tokens
+    # Gradients flow through Gumbel-Softmax to the Generator
     reconst_logits, _ = G(
-        fake_hard_tokens.detach(),
-        fake_hard_tokens.detach(),
+        fake_hard_tokens,  # [B, T, 8] differentiable hard tokens from Gumbel-Softmax
+        fake_hard_tokens,  # target = input for teacher-forcing
         context=original_context
     )
     
@@ -477,7 +669,7 @@ def compute_generator_loss(
         'G/loss_total': g_loss.item()
     }
     
-    return g_loss, loss_dict, fake_hard_tokens
+    return g_loss, loss_dict
 
 
 def check_gradient_flow(model, name="Model"):
