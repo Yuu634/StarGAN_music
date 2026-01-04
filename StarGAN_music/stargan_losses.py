@@ -488,7 +488,8 @@ def compute_discriminator_loss(
     vocab_path,
     lambda_cls=1.0,
     lambda_gp=10.0,
-    temperature=0.5
+    temperature=0.5,
+    device=None
 ):
     """
     Compute Discriminator loss with gradient flow through Generator
@@ -512,7 +513,6 @@ def compute_discriminator_loss(
         d_loss: Total discriminator loss
         loss_dict: Dictionary of individual losses
     """
-    device = D.device  # Use Discriminator device instead of real_scores device
     real_scores = real_scores.long()
     B, T, _ = real_scores.shape
     
@@ -535,7 +535,7 @@ def compute_discriminator_loss(
     d_loss_cls = F.binary_cross_entropy_with_logits(
         real_cls_logits,
         real_labels.float()
-    )
+    ).to(device)
     
     # ========== Fake score processing (gradient flows!) ==========
     fake_logits, fake_input_dict = G(
@@ -556,7 +556,7 @@ def compute_discriminator_loss(
     d_loss_fake = F.binary_cross_entropy_with_logits(
         fake_cls_logits,
         real_labels.float()  # Fool D into thinking fake is real
-    )
+    ).to(device)
     
     # ========== Gradient Penalty (simplified) ==========
     # For soft embeddings, gradient penalty is less critical
@@ -588,7 +588,8 @@ def compute_generator_loss(
     emb_size,
     lambda_cls=1.0,
     lambda_rec=10.0,
-    temperature=0.5
+    temperature=0.5,
+    device=None
 ):
     """
     Compute Generator loss with gradient flow through Discriminator
@@ -614,14 +615,12 @@ def compute_generator_loss(
         loss_dict: Dictionary of individual losses
         fake_hard_tokens: [B, T, 8] Generated discrete tokens
     """
-    device_g = G.device if hasattr(G, 'device') else 'cuda:0'  # Generator device
-    device_d = D.device  # Discriminator device
     real_scores = real_scores.long()
     B, T, _ = real_scores.shape
     
     # Move real_scores to Generator device
-    if real_scores.device != device_g:
-        real_scores = real_scores.to(device_g)
+    if real_scores.device != device:
+        real_scores = real_scores.to(device)
     
     # ========== Original → Target transformation ==========
     fake_logits, fake_input_dict = G(
@@ -643,10 +642,10 @@ def compute_generator_loss(
     g_loss_adv = F.binary_cross_entropy_with_logits(
         fake_cls_logits,
         torch.zeros_like(fake_cls_logits)  # Try to make D think it's original domain
-    )
+    ).to(device)
     
     # Domain classification loss (skip for now)
-    g_loss_cls = torch.tensor(0.0, device=device_d)
+    g_loss_cls = torch.tensor(0.0, device=device)
     
     # ========== Convert fake_logits to discrete tokens (DIFFERENTIABLE via Gumbel-Softmax) ==========
     # Use Gumbel-Softmax for more stable and reliable gradient flow
@@ -670,14 +669,14 @@ def compute_generator_loss(
     # Reconstruction loss: Cross-entropy per feature
     g_loss_rec = 0
     for feature_idx, feature_name in enumerate(AMADEUS_FIELDS):
-        reconst_logit = reconst_logits[feature_name]  # [B, T, vocab_size]
+        reconst_logit = reconst_logits[0][feature_name]  # [B, T, vocab_size]
         target_token = real_scores[:, :, feature_idx]  # [B, T]
         
         g_loss_rec += F.cross_entropy(
             reconst_logit.reshape(-1, reconst_logit.size(-1)),
             target_token.reshape(-1),
             ignore_index=-1
-        )
+        ).to(device)
     
     g_loss_rec = g_loss_rec / len(AMADEUS_FIELDS)
     

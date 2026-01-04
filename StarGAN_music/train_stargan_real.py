@@ -47,6 +47,7 @@ class StarGANTrainer:
         moonbeam_config_path: str,
         moonbeam_checkpoint_path: str,
         num_domains: int = 108,
+        selected_attrs: list = None,
         g_lr: float = 1e-4,
         d_lr: float = 1e-4,
         lambda_cls: float = 1.0,
@@ -77,6 +78,7 @@ class StarGANTrainer:
         """
         self.device = device
         self.num_domains = num_domains
+        self.selected_attrs = selected_attrs
         self.lambda_cls = lambda_cls
         self.lambda_rec = lambda_rec
         self.lambda_gp = lambda_gp
@@ -88,17 +90,15 @@ class StarGANTrainer:
         # Multi-GPU device setup
         if use_multi_gpu and torch.cuda.device_count() >= 3:
             self.device_g = 'cuda:0'  # Generator GPU 0
-            self.device_g_aux = 'cuda:1'  # Generator auxiliary GPU 1
-            self.device_d = 'cuda:2'  # Discriminator GPU 2
+            self.device_d = 'cuda:1'  # Discriminator GPU 1
             self.device_t5 = 'cuda:0'  # T5 encoder on GPU 0
             print(f"\n[Multi-GPU Setup]")
-            print(f"  Generator (Amadeus): GPU 0 + GPU 1 (DataParallel)")
-            print(f"  Discriminator (Moonbeam): GPU 2")
+            print(f"  Generator (Amadeus): GPU 0")
+            print(f"  Discriminator (Moonbeam): GPU 1")
             print(f"  T5 Encoder: GPU 0")
             print(f"  Total GPUs available: {torch.cuda.device_count()}")
         else:
             self.device_g = device
-            self.device_g_aux = device
             self.device_d = device
             self.device_t5 = device
             print(f"\n[Single GPU Setup] Using device: {device}")
@@ -127,10 +127,10 @@ class StarGANTrainer:
         )
         
         # Apply multi-GPU distribution for Generator if enabled
-        if self.use_multi_gpu and torch.cuda.device_count() >= 3:
-            print("\nApplying DataParallel to Generator (GPU 0 + GPU 1)...")
-            self.G = DataParallel(self.G, device_ids=[0, 1])
-            print(f"  Generator successfully distributed across GPUs 0 and 1")
+        #if self.use_multi_gpu and torch.cuda.device_count() >= 3:
+        #    print("\nApplying DataParallel to Generator (GPU 0 + GPU 1)...")
+        #    self.G = DataParallel(self.G, device_ids=[0, 1])
+        #    print(f"  Generator successfully distributed across GPUs 0 and 1")
         
         # Set to training mode
         self.G.train()
@@ -138,8 +138,8 @@ class StarGANTrainer:
         
         # Load T5 encoder for text prompts (for teacher-forcing context)
         print("Loading T5 Encoder for text context...")
-        self.t5_tokenizer = T5Tokenizer.from_pretrained('google/flan-t5-large')
-        self.t5_encoder = T5EncoderModel.from_pretrained('google/flan-t5-large').to(self.device_t5)
+        self.t5_tokenizer = T5Tokenizer.from_pretrained('google/flan-t5-base')
+        self.t5_encoder = T5EncoderModel.from_pretrained('google/flan-t5-base').to(self.device_t5)
         self.t5_encoder.eval()
         
         # Create projection layer: sum of all vocab_sizes → Discriminator hidden_size
@@ -194,7 +194,8 @@ class StarGANTrainer:
         # Optimizers - include projection layer and embedding layers in generator optimizer for better gradient flow
         # For DataParallel, use self.G.module.parameters() to access actual parameters
         if self.use_multi_gpu and torch.cuda.device_count() >= 3:
-            g_params = list(self.G.module.parameters()) + list(self.embedding_layers.parameters())
+            #g_params = list(self.G.module.parameters()) + list(self.embedding_layers.parameters())
+            g_params = list(self.G.parameters()) + list(self.embedding_layers.parameters())
         else:
             g_params = list(self.G.parameters()) + list(self.embedding_layers.parameters())
         d_params = list(self.D.parameters()) + list(self.projection_layer.parameters())
@@ -346,7 +347,8 @@ class StarGANTrainer:
             vocab_path=self.vocab_path,
             lambda_cls=self.lambda_cls,
             lambda_gp=self.lambda_gp,
-            temperature=self.temperature
+            temperature=self.temperature,
+            device=self.device_d
         )
         
         d_loss.backward()
@@ -364,7 +366,7 @@ class StarGANTrainer:
         
         self.g_optimizer.zero_grad()
         
-        """g_loss, g_logs = compute_generator_loss(
+        g_loss, g_logs = compute_generator_loss(
             G=self.G,
             D=self.D,
             real_scores=real_scores,
@@ -377,14 +379,15 @@ class StarGANTrainer:
             emb_size=self.emb_size,
             lambda_cls=self.lambda_cls,
             lambda_rec=self.lambda_rec,
-            temperature=self.temperature
+            temperature=self.temperature,
+            device=self.device_g
         )
         
         g_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.G.parameters(), max_norm=1.0)
         self.g_optimizer.step()
         
-        g_loss_val = g_loss.item()"""
+        g_loss_val = g_loss.item()
         
         # Combine logs
         logs = {**d_logs, **g_logs}
@@ -447,17 +450,22 @@ class StarGANTrainer:
             self.current_batch_size = B  # Track batch size for OOM recovery
             
             # Get original domain index (first domain with label=1, since labels are multi-hot binary)
-            original_domain_idx = torch.where(original_labels == 1)[1]  # [B]
+            original_domain_idx = torch.where(original_labels == 1)[1].tolist()  # [B]
             
             # Generate random target domain (different from original)
-            target_domain_idx = torch.randint(0, self.num_domains, (B,), device=self.device)
+            target_domain_idx = torch.randint(0, self.num_domains, (B,), device=self.device).tolist()
             
-            # Create simple text prompts from domain indices
-            original_prompts = [f"Domain {idx.item()}" for idx in original_domain_idx]
-            target_prompts = [f"Domain {idx.item()}" for idx in target_domain_idx]
+            # Create text prompts from domain indices with selected_attrs
+            # Convert tensor indices to list for indexing self.selected_attrs
+            original_domain_vocab_list = [self.selected_attrs[idx] for idx in original_domain_idx]
+            target_domain_vocab_list = [self.selected_attrs[idx] for idx in target_domain_idx]
+            
+            # Get selected_attrs for each domain in batch
+            original_prompts = " and ".join(original_domain_vocab_list)
+            target_prompts = " and ".join(target_domain_vocab_list)
             
             # Encode prompts with T5 (keep tokenizer output as context)
-            # Original context
+            # Original context - use tokenizer output dict (input_ids, attention_mask)
             original_input = self.t5_tokenizer(
                 original_prompts,
                 return_tensors='pt',
@@ -465,10 +473,9 @@ class StarGANTrainer:
                 truncation=True,
                 max_length=128
             ).to(self.device_t5)
-            # original_input: {'input_ids': [B, 128], 'attention_mask': [B, 128]}
-            original_context = dict(original_input)  # Keep as dict for Amadeus context
+            original_context = dict(original_input)  # Keep as dict for Amadeus context: {'input_ids': [1, 128], 'attention_mask': [1, 128]}
             
-            # Target context
+            # Target context - use tokenizer output dict (input_ids, attention_mask)
             target_input = self.t5_tokenizer(
                 target_prompts,
                 return_tensors='pt',
@@ -476,8 +483,17 @@ class StarGANTrainer:
                 truncation=True,
                 max_length=128
             ).to(self.device_t5)
-            # target_input: {'input_ids': [B, 128], 'attention_mask': [B, 128]}
-            target_context = dict(target_input)  # Keep as dict for Amadeus context
+            target_context = dict(target_input)  # Keep as dict for Amadeus context: {'input_ids': [1, 128], 'attention_mask': [1, 128]}
+            
+            # Phase 1: Move context tensors to Generator device (GPU 0) BEFORE training
+            # This ensures all tensors in the computational graph are on the same device
+            #if isinstance(target_context, dict):
+            #    target_context = {k: v.to(self.device_g, non_blocking=True) if torch.is_tensor(v) else v 
+            #                     for k, v in target_context.items()}
+            
+            #if isinstance(original_context, dict):
+            #    original_context = {k: v.to(self.device_g, non_blocking=True) if torch.is_tensor(v) else v 
+            #                       for k, v in original_context.items()}
             
             # Training step with OOM handling
             train_success = False
@@ -523,6 +539,7 @@ class StarGANTrainer:
             
             # Logging only if training was successful
             if train_success:
+                print("Iteration Success!")
                 if (i + 1) % log_interval == 0:
                     elapsed = time.time() - start_time
                     elapsed_str = str(datetime.timedelta(seconds=int(elapsed)))
@@ -607,13 +624,14 @@ def main():
     parser.add_argument('--resume_iters', type=int, default=None, help='resume training from this step')
     
     # Data and I/O (from main.py)
+    model_name = 'MidiCaps-v0'
     parser.add_argument('--score_dir', type=str, default='../Amadeus/dataset/MidiCaps/corpus/tuneidx_', help='Training data directory')
     parser.add_argument('--attr_path', type=str, default='../Dataset/MidiCaps/train.json', help='Attribute path')
     parser.add_argument('--vocab_path', type=str, default='../Amadeus/models/Amadeus-S/files/checkpoints/vocab_LakhALLFined_nb8.json', help='Vocabulary path')
-    parser.add_argument('--model_save_dir', type=str, default='stargan/models', help='Checkpoint save directory')
-    parser.add_argument('--log_dir', type=str, default='stargan/logs', help='Log directory')
-    parser.add_argument('--sample_dir', type=str, default='stargan/samples', help='Sample directory')
-    parser.add_argument('--result_dir', type=str, default='stargan/results', help='Result directory')
+    parser.add_argument('--model_save_dir', type=str, default=f'output/{model_name}/models', help='Checkpoint save directory')
+    parser.add_argument('--log_dir', type=str, default=f'output/{model_name}/logs', help='Log directory')
+    parser.add_argument('--sample_dir', type=str, default=f'output/{model_name}/samples', help='Sample directory')
+    parser.add_argument('--result_dir', type=str, default=f'output/{model_name}/results', help='Result directory')
     parser.add_argument('--encoding', type=str, default='nb8', help='Encoding type')
     parser.add_argument('--dataset', type=str, default='MidiCaps', help='Dataset name')
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'], help='Mode')
@@ -651,6 +669,7 @@ def main():
         moonbeam_config_path=args.d_configpath,
         moonbeam_checkpoint_path=args.d_modelpath,  # Use d_modelpath as checkpoint
         num_domains=len(args.selected_attrs),  # Number of domains from selected_attrs
+        selected_attrs=args.selected_attrs,
         g_lr=args.g_lr,
         d_lr=args.d_lr,
         lambda_cls=args.lambda_cls,
