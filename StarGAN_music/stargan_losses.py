@@ -372,6 +372,11 @@ def logits_to_embeddings_via_projection(fake_logits, projection_layer, vocab_siz
     # Concatenate all feature probabilities: [B, T, total_vocab_size]
     concatenated = torch.cat(logits_list, dim=-1)  # [B, T, Σvocab_sizes]
     
+    # Move to projection_layer device if needed
+    projection_device = projection_layer.weight.device
+    if concatenated.device != projection_device:
+        concatenated = concatenated.to(projection_device)
+    
     # Apply projection layer: [B, T, Σvocab_sizes] → [B, T, hidden_size]
     embeddings = projection_layer(concatenated)  # [B, T, hidden_size]
     
@@ -460,6 +465,11 @@ def tokens_to_embeddings_via_projection(amadeus_tokens, projection_layer, vocab_
     # Concatenate all feature one-hots: [B, T, total_vocab_size]
     concatenated = torch.cat(onehot_list, dim=-1)  # [B, T, Σvocab_sizes]
     
+    # Move to projection_layer device if needed
+    projection_device = projection_layer.weight.device
+    if concatenated.device != projection_device:
+        concatenated = concatenated.to(projection_device)
+    
     # Apply projection layer: [B, T, Σvocab_sizes] → [B, T, hidden_size]
     embeddings = projection_layer(concatenated)  # [B, T, hidden_size]
     
@@ -502,9 +512,16 @@ def compute_discriminator_loss(
         d_loss: Total discriminator loss
         loss_dict: Dictionary of individual losses
     """
-    device = real_scores.device
+    device = D.device  # Use Discriminator device instead of real_scores device
     real_scores = real_scores.long()
     B, T, _ = real_scores.shape
+    
+    # Move real_scores to Discriminator device if needed
+    if real_scores.device != device:
+        real_scores = real_scores.to(device)
+    
+    # Move labels to Discriminator device
+    real_labels = real_labels.to(device)
     
     # ========== Real score processing ==========
     # Convert discrete Amadeus tokens to embeddings via projection layer (FULLY DIFFERENTIABLE!)
@@ -522,8 +539,8 @@ def compute_discriminator_loss(
     
     # ========== Fake score processing (gradient flows!) ==========
     fake_logits, fake_input_dict = G(
-        real_scores,
-        real_scores,  # target = input for teacher-forcing
+        real_scores.to(G.device if hasattr(G, 'device') else 'cuda:0'),  # Move to Generator device
+        real_scores.to(G.device if hasattr(G, 'device') else 'cuda:0'),  # target = input for teacher-forcing
         context=context
     )
     # fake_logits: Dict of {feature: [B, T, vocab_size]}
@@ -597,9 +614,14 @@ def compute_generator_loss(
         loss_dict: Dictionary of individual losses
         fake_hard_tokens: [B, T, 8] Generated discrete tokens
     """
-    device = real_scores.device
+    device_g = G.device if hasattr(G, 'device') else 'cuda:0'  # Generator device
+    device_d = D.device  # Discriminator device
     real_scores = real_scores.long()
     B, T, _ = real_scores.shape
+    
+    # Move real_scores to Generator device
+    if real_scores.device != device_g:
+        real_scores = real_scores.to(device_g)
     
     # ========== Original → Target transformation ==========
     fake_logits, fake_input_dict = G(
@@ -624,7 +646,7 @@ def compute_generator_loss(
     )
     
     # Domain classification loss (skip for now)
-    g_loss_cls = torch.tensor(0.0, device=device)
+    g_loss_cls = torch.tensor(0.0, device=device_d)
     
     # ========== Convert fake_logits to discrete tokens (DIFFERENTIABLE via Gumbel-Softmax) ==========
     # Use Gumbel-Softmax for more stable and reliable gradient flow

@@ -16,6 +16,7 @@ from omegaconf import OmegaConf
 import json
 import time
 import datetime
+from torch.nn.parallel import DataParallel
 
 # Add Amadeus and Moonbeam to path
 sys.path.append("../Amadeus")
@@ -53,7 +54,8 @@ class StarGANTrainer:
         lambda_gp: float = 10.0,
         n_critic: int = 5,
         temperature: float = 0.5,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        use_multi_gpu: bool = True
     ):
         """
         Args:
@@ -71,6 +73,7 @@ class StarGANTrainer:
             n_critic: Discriminator updates per Generator update
             temperature: Gumbel-Softmax temperature
             device: Training device
+            use_multi_gpu: Enable multi-GPU model parallelization
         """
         self.device = device
         self.num_domains = num_domains
@@ -80,6 +83,30 @@ class StarGANTrainer:
         self.n_critic = n_critic
         self.temperature = temperature
         self.vocab_path = amadeus_vocab_path  # Save vocab path for loss functions
+        self.use_multi_gpu = use_multi_gpu
+        
+        # Multi-GPU device setup
+        if use_multi_gpu and torch.cuda.device_count() >= 3:
+            self.device_g = 'cuda:0'  # Generator GPU 0
+            self.device_g_aux = 'cuda:1'  # Generator auxiliary GPU 1
+            self.device_d = 'cuda:2'  # Discriminator GPU 2
+            self.device_t5 = 'cuda:0'  # T5 encoder on GPU 0
+            print(f"\n[Multi-GPU Setup]")
+            print(f"  Generator (Amadeus): GPU 0 + GPU 1 (DataParallel)")
+            print(f"  Discriminator (Moonbeam): GPU 2")
+            print(f"  T5 Encoder: GPU 0")
+            print(f"  Total GPUs available: {torch.cuda.device_count()}")
+        else:
+            self.device_g = device
+            self.device_g_aux = device
+            self.device_d = device
+            self.device_t5 = device
+            print(f"\n[Single GPU Setup] Using device: {device}")
+        
+        # OOM handling state
+        self.current_batch_size = None
+        self.oom_count = 0
+        self.max_oom_retries = 3
         
         # Load Amadeus Generator (from model_zoo.py)
         print("Loading Amadeus Generator...")
@@ -87,7 +114,7 @@ class StarGANTrainer:
             config_path=amadeus_config_path,
             checkpoint_path=amadeus_checkpoint_path,
             vocab_path=amadeus_vocab_path,
-            device=device
+            device=self.device_g
         )
         
         # Load Moonbeam Discriminator (LlamaForSequenceClassification)
@@ -96,8 +123,14 @@ class StarGANTrainer:
             config_path=moonbeam_config_path,
             checkpoint_path=moonbeam_checkpoint_path,
             num_domains=num_domains,
-            device=device
+            device=self.device_d
         )
+        
+        # Apply multi-GPU distribution for Generator if enabled
+        if self.use_multi_gpu and torch.cuda.device_count() >= 3:
+            print("\nApplying DataParallel to Generator (GPU 0 + GPU 1)...")
+            self.G = DataParallel(self.G, device_ids=[0, 1])
+            print(f"  Generator successfully distributed across GPUs 0 and 1")
         
         # Set to training mode
         self.G.train()
@@ -106,7 +139,7 @@ class StarGANTrainer:
         # Load T5 encoder for text prompts (for teacher-forcing context)
         print("Loading T5 Encoder for text context...")
         self.t5_tokenizer = T5Tokenizer.from_pretrained('google/flan-t5-large')
-        self.t5_encoder = T5EncoderModel.from_pretrained('google/flan-t5-large').to(device)
+        self.t5_encoder = T5EncoderModel.from_pretrained('google/flan-t5-large').to(self.device_t5)
         self.t5_encoder.eval()
         
         # Create projection layer: sum of all vocab_sizes → Discriminator hidden_size
@@ -135,8 +168,9 @@ class StarGANTrainer:
         print(f"  Total vocab size: {total_vocab_size} (sum of {vocab_size_list})")
         
         # Single projection layer: total_vocab_size → hidden_size
-        self.projection_layer = nn.Linear(total_vocab_size, hidden_size).to(device)
-        print(f"  Created projection layer: {total_vocab_size} → {hidden_size}")
+        # Place on Discriminator GPU for efficient input to D
+        self.projection_layer = nn.Linear(total_vocab_size, hidden_size).to(self.device_d)
+        print(f"  Created projection layer: {total_vocab_size} → {hidden_size} (on {self.device_d})")
         
         # Store vocab sizes for later use in loss functions
         self.vocab_size_list = vocab_size_list
@@ -150,15 +184,20 @@ class StarGANTrainer:
         
         for vocab_size in vocab_size_list:
             if emb_size != 0:
-                self.embedding_layers.append(nn.Embedding(vocab_size, emb_size).to(device))
+                # Place embedding layers on Generator GPU 0 for faster access
+                self.embedding_layers.append(nn.Embedding(vocab_size, emb_size).to(self.device_g))
         
         self.embedding_layers = nn.ModuleList(self.embedding_layers)
         self.emb_size = emb_size
-        print(f"  Created {len(self.embedding_layers)} embedding layers with size {emb_size}")
+        print(f"  Created {len(self.embedding_layers)} embedding layers with size {emb_size} (on {self.device_g})")
         
         # Optimizers - include projection layer and embedding layers in generator optimizer for better gradient flow
-        g_params = list(self.G.parameters()) + list(self.projection_layer.parameters()) + list(self.embedding_layers.parameters())
-        d_params = self.D.parameters()
+        # For DataParallel, use self.G.module.parameters() to access actual parameters
+        if self.use_multi_gpu and torch.cuda.device_count() >= 3:
+            g_params = list(self.G.module.parameters()) + list(self.embedding_layers.parameters())
+        else:
+            g_params = list(self.G.parameters()) + list(self.embedding_layers.parameters())
+        d_params = list(self.D.parameters()) + list(self.projection_layer.parameters())
         
         self.g_optimizer = optim.Adam(g_params, lr=g_lr, betas=(0.5, 0.999))
         self.d_optimizer = optim.Adam(d_params, lr=d_lr, betas=(0.5, 0.999))
@@ -325,7 +364,7 @@ class StarGANTrainer:
         
         self.g_optimizer.zero_grad()
         
-        g_loss, g_logs = compute_generator_loss(
+        """g_loss, g_logs = compute_generator_loss(
             G=self.G,
             D=self.D,
             real_scores=real_scores,
@@ -345,7 +384,7 @@ class StarGANTrainer:
         torch.nn.utils.clip_grad_norm_(self.G.parameters(), max_norm=1.0)
         self.g_optimizer.step()
         
-        g_loss_val = g_loss.item()
+        g_loss_val = g_loss.item()"""
         
         # Combine logs
         logs = {**d_logs, **g_logs}
@@ -395,8 +434,8 @@ class StarGANTrainer:
                 continue
             
             # Extract batch data
-            real_scores = score.to(self.device)  # [B, T, 8]
-            original_labels = label.to(self.device)  # [B, 108]
+            real_scores = score.to(self.device_g)  # [B, T, 8] -> move to Generator GPU
+            original_labels = label.to(self.device_d)  # [B, 108] -> move to Discriminator GPU
             
             if real_scores.shape[1] > 3072:
                 print("Skipping batch with sequence length > Amadeus max input length (3072)...")
@@ -405,6 +444,7 @@ class StarGANTrainer:
             # Generate text prompts for original and target domains
             # For simplicity, use domain indices as text prompts
             B = original_labels.size(0)
+            self.current_batch_size = B  # Track batch size for OOM recovery
             
             # Get original domain index (first domain with label=1, since labels are multi-hot binary)
             original_domain_idx = torch.where(original_labels == 1)[1]  # [B]
@@ -424,7 +464,7 @@ class StarGANTrainer:
                 padding='max_length',
                 truncation=True,
                 max_length=128
-            ).to(self.device)
+            ).to(self.device_t5)
             # original_input: {'input_ids': [B, 128], 'attention_mask': [B, 128]}
             original_context = dict(original_input)  # Keep as dict for Amadeus context
             
@@ -435,34 +475,71 @@ class StarGANTrainer:
                 padding='max_length',
                 truncation=True,
                 max_length=128
-            ).to(self.device)
+            ).to(self.device_t5)
             # target_input: {'input_ids': [B, 128], 'attention_mask': [B, 128]}
             target_context = dict(target_input)  # Keep as dict for Amadeus context
             
-            # Training step
-            d_loss, g_loss, logs = self.train_step(
-                real_scores=real_scores,
-                target_context=target_context,
-                original_context=original_context,
-                real_labels=original_labels
-            )
+            # Training step with OOM handling
+            train_success = False
+            current_oom_retry = 0
             
-            # Logging
-            if (i + 1) % log_interval == 0:
-                elapsed = time.time() - start_time
-                elapsed_str = str(datetime.timedelta(seconds=int(elapsed)))
-                log_str = f"Elapsed [{elapsed_str}], Iteration [{i+1}/{num_iters}], "
-                log_str += ", ".join([f"{k}: {v:.4f}" for k, v in logs.items()])
-                print(log_str)
+            while not train_success and current_oom_retry < self.max_oom_retries:
+                try:
+                    # Clear cache before attempting training
+                    torch.cuda.empty_cache()
+                    
+                    # Training step
+                    d_loss, g_loss, logs = self.train_step(
+                        real_scores=real_scores,
+                        target_context=target_context,
+                        original_context=original_context,
+                        real_labels=original_labels
+                    )
+                    
+                    train_success = True
+                    self.oom_count = 0  # Reset OOM counter on success
+                    
+                except RuntimeError as e:
+                    if 'out of memory' in str(e).lower():
+                        current_oom_retry += 1
+                        self.oom_count += 1
+                        print(f"\n[OOM Error] Iteration {i}: CUDA out of memory (Attempt {current_oom_retry}/{self.max_oom_retries})")
+                        print(f"  Batch size: {B}, Seq length: {real_scores.shape[1]}")
+                        
+                        # Try to reduce sequence length or batch size
+                        if current_oom_retry < self.max_oom_retries:
+                            # For now, skip this batch and retry next iteration
+                            # In production, implement gradual batch size reduction
+                            torch.cuda.empty_cache()
+                            time.sleep(2)  # Wait before retry
+                            print(f"  Retrying after clearing cache...")
+                        else:
+                            print(f"  Max OOM retries exceeded. Skipping batch.")
+                            train_success = False  # Mark as failed to skip logging
+                            break
+                    else:
+                        # Re-raise non-OOM runtime errors
+                        raise
             
-            # Save checkpoint
-            if (i + 1) % save_interval == 0:
-                epoch = i // len(dataloader)
-                self.save_checkpoint(
-                    save_dir=save_dir,
-                    epoch=epoch,
-                    step=i + 1
-                )
+            # Logging only if training was successful
+            if train_success:
+                if (i + 1) % log_interval == 0:
+                    elapsed = time.time() - start_time
+                    elapsed_str = str(datetime.timedelta(seconds=int(elapsed)))
+                    log_str = f"Elapsed [{elapsed_str}], Iteration [{i+1}/{num_iters}], "
+                    log_str += ", ".join([f"{k}: {v:.4f}" for k, v in logs.items()])
+                    if self.oom_count > 0:
+                        log_str += f", OOM Events: {self.oom_count}"
+                    print(log_str)
+                
+                # Save checkpoint
+                if (i + 1) % save_interval == 0:
+                    epoch = i // len(dataloader)
+                    self.save_checkpoint(
+                        save_dir=save_dir,
+                        epoch=epoch,
+                        step=i + 1
+                    )
         
         # Final checkpoint
         final_epoch = num_iters // len(dataloader)
