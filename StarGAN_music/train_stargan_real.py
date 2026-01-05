@@ -17,6 +17,7 @@ import json
 import time
 import datetime
 from torch.nn.parallel import DataParallel
+from datetime import datetime
 
 # Add Amadeus and Moonbeam to path
 sys.path.append("../Amadeus")
@@ -32,6 +33,99 @@ from transformers import LlamaForSequenceClassification, LlamaConfig, T5Tokenize
 # Import loss functions
 from stargan_losses import compute_discriminator_loss, compute_generator_loss
 from data_loader import get_loader
+
+
+def split_sequence_with_sliding_window(sequence, window_size=3072, stride=None):
+    """
+    Split a sequence longer than window_size into overlapping windows.
+    
+    Args:
+        sequence: Tensor of shape [T, ...] where T is sequence length
+        window_size: Maximum length per window (default: Amadeus max input length = 3072)
+        stride: Step size for sliding window. If None, stride = window_size (no overlap)
+    
+    Returns:
+        List of sequence windows, each with length <= window_size
+        Also returns start positions for each window
+    
+    Example:
+        >>> seq = torch.randn(5000, 8)  # Longer than window_size
+        >>> windows, positions = split_sequence_with_sliding_window(seq, window_size=3072, stride=1536)
+        >>> # windows[0].shape = [3072, 8]
+        >>> # windows[1].shape = [3072, 8]
+        >>> # windows[2].shape = [1928, 8]  (remaining)
+    """
+    seq_len = sequence.shape[0]
+    
+    # If sequence is shorter than window size, return as is
+    if seq_len <= window_size:
+        return [sequence], [0]
+    
+    # Default stride = window_size (no overlap)
+    if stride is None:
+        stride = window_size
+    
+    windows = []
+    positions = []
+    
+    # Create sliding windows
+    current_pos = 0
+    while current_pos < seq_len:
+        end_pos = min(current_pos + window_size, seq_len)
+        window = sequence[current_pos:end_pos]
+        windows.append(window)
+        positions.append(current_pos)
+        
+        # Break if we've reached the end
+        if end_pos >= seq_len:
+            break
+        
+        current_pos += stride
+    
+    return windows, positions
+
+
+def aggregate_window_outputs(window_outputs, aggregation_method='mean'):
+    """
+    Aggregate predictions from multiple sliding windows.
+    
+    Args:
+        window_outputs: List of dicts, each containing:
+            - 'd_real': Real/fake discrimination score [B, 1]
+            - 'd_fake': Real/fake discrimination score [B, 1]
+            - 'd_cls': Domain classification logits [B, num_domains]
+            - Other optional keys
+        aggregation_method: 'mean' (average), 'max' (maximum), or 'first' (first window only)
+    
+    Returns:
+        Aggregated output dict with same structure as input
+    """
+    if len(window_outputs) == 1:
+        return window_outputs[0]
+    
+    # Stack outputs from all windows
+    aggregated = {}
+    
+    for key in window_outputs[0].keys():
+        values = [out[key] for out in window_outputs]
+        
+        # Stack along a new dimension
+        stacked = torch.stack(values, dim=0)  # [num_windows, ...]
+        
+        if aggregation_method == 'mean':
+            aggregated[key] = stacked.mean(dim=0)
+        elif aggregation_method == 'max':
+            # For classification logits, take max; for scores, take mean
+            if 'cls' in key:
+                aggregated[key] = stacked.max(dim=0)[0]
+            else:
+                aggregated[key] = stacked.mean(dim=0)
+        elif aggregation_method == 'first':
+            aggregated[key] = window_outputs[0][key]
+        else:
+            raise ValueError(f"Unknown aggregation method: {aggregation_method}")
+    
+    return aggregated
 
 
 class StarGANTrainer:
@@ -56,7 +150,10 @@ class StarGANTrainer:
         n_critic: int = 5,
         temperature: float = 0.5,
         device: str = 'cuda',
-        use_multi_gpu: bool = True
+        use_multi_gpu: bool = True,
+        window_size: int = 3072,
+        window_stride: int = None,
+        window_aggregation: str = 'mean'
     ):
         """
         Args:
@@ -75,6 +172,9 @@ class StarGANTrainer:
             temperature: Gumbel-Softmax temperature
             device: Training device
             use_multi_gpu: Enable multi-GPU model parallelization
+            window_size: Sliding window size (default: 3072, Amadeus max input length)
+            window_stride: Sliding window stride (default: None = no overlap)
+            window_aggregation: Method to aggregate window outputs ('mean', 'max', 'first')
         """
         self.device = device
         self.num_domains = num_domains
@@ -86,6 +186,9 @@ class StarGANTrainer:
         self.temperature = temperature
         self.vocab_path = amadeus_vocab_path  # Save vocab path for loss functions
         self.use_multi_gpu = use_multi_gpu
+        self.window_size = window_size
+        self.window_stride = window_stride if window_stride is not None else window_size
+        self.window_aggregation = window_aggregation
         
         # Multi-GPU device setup
         if use_multi_gpu and torch.cuda.device_count() >= 3:
@@ -106,7 +209,7 @@ class StarGANTrainer:
         # OOM handling state
         self.current_batch_size = None
         self.oom_count = 0
-        self.max_oom_retries = 3
+        self.max_oom_retries = 1
         
         # Load Amadeus Generator (from model_zoo.py)
         print("Loading Amadeus Generator...")
@@ -298,6 +401,8 @@ class StarGANTrainer:
             print(f"Unexpected keys: {unexpected_keys[:5]}...")  # Show first 5
         
         model.to(device)
+        # Ensure all parameters are float32 for consistent dtype throughout the model
+        model = model.float()
         model.train()
         
         print(f"Moonbeam Discriminator loaded successfully!")
@@ -306,6 +411,7 @@ class StarGANTrainer:
         print(f"  Hidden size: {llama_config.hidden_size}")
         print(f"  Num layers: {llama_config.num_hidden_layers}")
         print(f"  Num classes: {llama_config.num_labels if hasattr(llama_config, 'num_labels') else num_domains}")
+        print(f"  Model dtype: {next(model.parameters()).dtype}")
         
         return model
     
@@ -397,8 +503,10 @@ class StarGANTrainer:
     def train(
         self,
         dataloader: DataLoader,
+        num_epochs: int = 1,
         num_iters: int = 200000,
         save_dir: str = './checkpoints',
+        log_dir: str = './logs',
         log_interval: int = 100,
         save_interval: int = 1000
     ):
@@ -409,159 +517,237 @@ class StarGANTrainer:
             dataloader: Training data loader
             num_iters: Number of training iterations
             save_dir: Directory to save checkpoints
+            log_dir: Directory to save training logs
             log_interval: Steps between logging
             save_interval: Steps between checkpoint saves
         """
         os.makedirs(save_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Create log file
+        log_file = os.path.join(log_dir, 'training_log.txt')
+        log_csv = os.path.join(log_dir, 'training_log.csv')
         
         # Initialize data iterator (solver.py style)
         data_iter = iter(dataloader)
         
-        print(f'Starting training for {num_iters} iterations...')
+        # Write header to CSV file
+        csv_header = None
+        csv_file_initialized = False
+        
+        # Initialize progress tracking
+        success_count = 0
+        failure_count = 0
+        
         start_time = time.time()
         
-        for i in range(num_iters):
-            # Fetch batch data with error handling (solver.py style)
-            try:
-                score, label = next(data_iter)
-            except StopIteration:
-                # Restart iterator when epoch ends
-                data_iter = iter(dataloader)
-                score, label = next(data_iter)
-            except FileNotFoundError as e:
-                #print(f"\n[Warning] FileNotFoundError at iteration {i}: {e}")
-                print(f"Skipping this batch and continuing...")
-                continue
-            except Exception as e:
-                #print(f"\n[Warning] Error at iteration {i}: {type(e).__name__}: {e}")
-                continue
+        for epoch in range(num_epochs):
+            data_iter = iter(dataloader)
             
-            # Extract batch data
-            real_scores = score.to(self.device_g)  # [B, T, 8] -> move to Generator GPU
-            original_labels = label.to(self.device_d)  # [B, 108] -> move to Discriminator GPU
-            
-            if real_scores.shape[1] > 3072:
-                print("Skipping batch with sequence length > Amadeus max input length (3072)...")
-                continue
-            
-            # Generate text prompts for original and target domains
-            # For simplicity, use domain indices as text prompts
-            B = original_labels.size(0)
-            self.current_batch_size = B  # Track batch size for OOM recovery
-            
-            # Get original domain index (first domain with label=1, since labels are multi-hot binary)
-            original_domain_idx = torch.where(original_labels == 1)[1].tolist()  # [B]
-            
-            # Generate random target domain (different from original)
-            target_domain_idx = torch.randint(0, self.num_domains, (B,), device=self.device).tolist()
-            
-            # Create text prompts from domain indices with selected_attrs
-            # Convert tensor indices to list for indexing self.selected_attrs
-            original_domain_vocab_list = [self.selected_attrs[idx] for idx in original_domain_idx]
-            target_domain_vocab_list = [self.selected_attrs[idx] for idx in target_domain_idx]
-            
-            # Get selected_attrs for each domain in batch
-            original_prompts = " and ".join(original_domain_vocab_list)
-            target_prompts = " and ".join(target_domain_vocab_list)
-            
-            # Encode prompts with T5 (keep tokenizer output as context)
-            # Original context - use tokenizer output dict (input_ids, attention_mask)
-            original_input = self.t5_tokenizer(
-                original_prompts,
-                return_tensors='pt',
-                padding='max_length',
-                truncation=True,
-                max_length=128
-            ).to(self.device_t5)
-            original_context = dict(original_input)  # Keep as dict for Amadeus context: {'input_ids': [1, 128], 'attention_mask': [1, 128]}
-            
-            # Target context - use tokenizer output dict (input_ids, attention_mask)
-            target_input = self.t5_tokenizer(
-                target_prompts,
-                return_tensors='pt',
-                padding='max_length',
-                truncation=True,
-                max_length=128
-            ).to(self.device_t5)
-            target_context = dict(target_input)  # Keep as dict for Amadeus context: {'input_ids': [1, 128], 'attention_mask': [1, 128]}
-            
-            # Phase 1: Move context tensors to Generator device (GPU 0) BEFORE training
-            # This ensures all tensors in the computational graph are on the same device
-            #if isinstance(target_context, dict):
-            #    target_context = {k: v.to(self.device_g, non_blocking=True) if torch.is_tensor(v) else v 
-            #                     for k, v in target_context.items()}
-            
-            #if isinstance(original_context, dict):
-            #    original_context = {k: v.to(self.device_g, non_blocking=True) if torch.is_tensor(v) else v 
-            #                       for k, v in original_context.items()}
-            
-            # Training step with OOM handling
-            train_success = False
-            current_oom_retry = 0
-            
-            while not train_success and current_oom_retry < self.max_oom_retries:
+            for i in range(num_iters):
+                # Fetch batch data with error handling (solver.py style)
                 try:
-                    # Clear cache before attempting training
-                    torch.cuda.empty_cache()
-                    
-                    # Training step
-                    d_loss, g_loss, logs = self.train_step(
-                        real_scores=real_scores,
-                        target_context=target_context,
-                        original_context=original_context,
-                        real_labels=original_labels
+                    score, label = next(data_iter)
+                except FileNotFoundError as e:
+                    #print(f"\n[Warning] FileNotFoundError at iteration {i}: {e}")
+                    #print(f"Skipping this batch and continuing...")
+                    failure_count += 1
+                    continue
+                except Exception as e:
+                    #print(f"\n[Warning] Error at iteration {i}: {type(e).__name__}: {e}")
+                    failure_count += 1
+                    continue
+                
+                # Extract batch data
+                real_scores = score.to(self.device_g)  # [B, T, 8] -> move to Generator GPU
+                original_labels = label.to(self.device_d)  # [B, 108] -> move to Discriminator GPU
+                
+                # Handle sequences longer than Amadeus max input length using sliding windows
+                seq_len = real_scores.shape[1]
+                
+                if seq_len > self.window_size:
+                    # Split the sequence into windows
+                    windows, positions = split_sequence_with_sliding_window(
+                        real_scores.squeeze(0),  # Remove batch dim [B, T, 8] -> [T, 8]
+                        window_size=self.window_size,
+                        stride=self.window_stride
                     )
-                    
-                    train_success = True
-                    self.oom_count = 0  # Reset OOM counter on success
-                    
-                except RuntimeError as e:
-                    if 'out of memory' in str(e).lower():
-                        current_oom_retry += 1
-                        self.oom_count += 1
-                        print(f"\n[OOM Error] Iteration {i}: CUDA out of memory (Attempt {current_oom_retry}/{self.max_oom_retries})")
-                        print(f"  Batch size: {B}, Seq length: {real_scores.shape[1]}")
+                else:
+                    # For shorter sequences, treat as single window
+                    windows = [real_scores.squeeze(0)]
+                    positions = [0]
+                
+                # Generate text prompts for original and target domains
+                # For simplicity, use domain indices as text prompts
+                B = original_labels.size(0)
+                self.current_batch_size = B  # Track batch size for OOM recovery
+                
+                # Get original domain index (first domain with label=1, since labels are multi-hot binary)
+                original_domain_idx = torch.where(original_labels == 1)[1].tolist()  # [B]
+                
+                # Generate random target domain (different from original)
+                target_domain_idx = torch.randint(0, self.num_domains, (B,), device=self.device).tolist()
+                
+                # Create text prompts from domain indices with selected_attrs
+                # Convert tensor indices to list for indexing self.selected_attrs
+                original_domain_vocab_list = [self.selected_attrs[idx] for idx in original_domain_idx]
+                target_domain_vocab_list = [self.selected_attrs[idx] for idx in target_domain_idx]
+                
+                # Get selected_attrs for each domain in batch
+                original_prompts = " and ".join(original_domain_vocab_list)
+                target_prompts = " and ".join(target_domain_vocab_list)
+                
+                # Encode prompts with T5 (keep tokenizer output as context)
+                # Original context - use tokenizer output dict (input_ids, attention_mask)
+                original_input = self.t5_tokenizer(
+                    original_prompts,
+                    return_tensors='pt',
+                    padding='max_length',
+                    truncation=True,
+                    max_length=128
+                ).to(self.device_t5)
+                original_context = dict(original_input)  # Keep as dict for Amadeus context: {'input_ids': [1, 128], 'attention_mask': [1, 128]}
+                
+                # Target context - use tokenizer output dict (input_ids, attention_mask)
+                target_input = self.t5_tokenizer(
+                    target_prompts,
+                    return_tensors='pt',
+                    padding='max_length',
+                    truncation=True,
+                    max_length=128
+                ).to(self.device_t5)
+                target_context = dict(target_input)  # Keep as dict for Amadeus context: {'input_ids': [1, 128], 'attention_mask': [1, 128]}
+                
+                # Training step with OOM handling
+                train_success = False
+                current_oom_retry = 0
+                
+                while not train_success and current_oom_retry < self.max_oom_retries:
+                    try:
+                        # Clear cache before attempting training
+                        torch.cuda.empty_cache()
                         
-                        # Try to reduce sequence length or batch size
-                        if current_oom_retry < self.max_oom_retries:
-                            # For now, skip this batch and retry next iteration
-                            # In production, implement gradual batch size reduction
-                            torch.cuda.empty_cache()
-                            time.sleep(2)  # Wait before retry
-                            print(f"  Retrying after clearing cache...")
+                        # Process sliding windows: infer on each window and aggregate results
+                        window_outputs = []
+                        for window_idx, window in enumerate(windows):
+                            # Add batch dimension back: [T, 8] -> [B, T, 8]
+                            window_batch = window.unsqueeze(0)
+                            
+                            #if window_idx == 0:
+                            #    print(f"  Processing window {window_idx + 1}/{len(windows)} (length: {window.shape[0]})")
+                            
+                            # Training step for this window
+                            d_loss_w, g_loss_w, logs_w = self.train_step(
+                                real_scores=window_batch,
+                                target_context=target_context,
+                                original_context=original_context,
+                                real_labels=original_labels
+                            )
+                            
+                            # Store window output (we'll aggregate after all windows)
+                            window_outputs.append((d_loss_w, g_loss_w, logs_w))
+                        
+                        # Aggregate results from all windows
+                        if len(windows) > 1:
+                            #print(f"  Aggregating results from {len(windows)} windows using '{self.window_aggregation}' method")
+                            # Simple aggregation: average loss across windows
+                            d_loss = sum(out[0] for out in window_outputs) / len(window_outputs)
+                            g_loss = sum(out[1] for out in window_outputs) / len(window_outputs)
+                            # Merge logs
+                            logs = {}
+                            for key in window_outputs[0][2].keys():
+                                logs[key] = sum(out[2][key] for out in window_outputs) / len(window_outputs)
                         else:
-                            print(f"  Max OOM retries exceeded. Skipping batch.")
-                            train_success = False  # Mark as failed to skip logging
-                            break
-                    else:
-                        # Re-raise non-OOM runtime errors
-                        raise
-            
-            # Logging only if training was successful
-            if train_success:
-                print("Iteration Success!")
-                if (i + 1) % log_interval == 0:
-                    elapsed = time.time() - start_time
-                    elapsed_str = str(datetime.timedelta(seconds=int(elapsed)))
-                    log_str = f"Elapsed [{elapsed_str}], Iteration [{i+1}/{num_iters}], "
-                    log_str += ", ".join([f"{k}: {v:.4f}" for k, v in logs.items()])
+                            d_loss, g_loss, logs = window_outputs[0]
+                        
+                        train_success = True
+                        self.oom_count = 0  # Reset OOM counter on success
+                        
+                    except RuntimeError as e:
+                        if 'out of memory' in str(e).lower():
+                            current_oom_retry += 1
+                            self.oom_count += 1
+                            print(f"\n[OOM Error] Iteration {i}: CUDA out of memory (Attempt {current_oom_retry}/{self.max_oom_retries})")
+                            print(f"  Batch size: {B}, Seq length: {real_scores.shape[1]}")
+                            
+                            # Try to reduce sequence length or batch size
+                            if current_oom_retry < self.max_oom_retries:
+                                # For now, skip this batch and retry next iteration
+                                # In production, implement gradual batch size reduction
+                                torch.cuda.empty_cache()
+                                time.sleep(2)  # Wait before retry
+                                print(f"  Retrying after clearing cache...")
+                            else:
+                                print(f"  Max OOM retries exceeded. Skipping batch.")
+                                train_success = False  # Mark as failed to skip logging
+                                break
+                        else:
+                            # Re-raise non-OOM runtime errors
+                            raise
+                
+                # Update progress counters
+                if train_success:
+                    success_count += 1
+                else:
+                    failure_count += 1
+                
+                # Print progress on the same line (carriage return)
+                progress_percent = ((i + 1) / num_iters) * 100
+                progress_str = f"Progress: {i+1}/{num_iters} ({progress_percent:.1f}%) | Success: {success_count} | Failure: {failure_count}"
+                print(progress_str, end='\r')
+                #if train_success:
+                if success_count % log_interval == 0:
+                    # Prepare log data
+                    log_data = {
+                        'epoch': epoch + 1,
+                        'iteration': i + 1,
+                        **logs
+                    }
+                    
+                    if self.oom_count > 0:
+                        log_data['oom_events'] = self.oom_count
+                    
+                    # Write to text log file
+                    log_str = f"Epoch [{log_data['epoch']}/{num_epochs}] | Iteration [{log_data['iteration']}/{num_iters}] | Success: {success_count} | Failure: {failure_count} | "
+                    log_str += ", ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in logs.items()])
                     if self.oom_count > 0:
                         log_str += f", OOM Events: {self.oom_count}"
-                    print(log_str)
+                    
+                    with open(log_file, 'a') as f:
+                        f.write(log_str + '\n')
+                    
+                    # Write to CSV file
+                    if not csv_file_initialized:
+                        csv_header = list(log_data.keys())
+                        with open(log_csv, 'w') as f:
+                            f.write(','.join(csv_header) + '\n')
+                        csv_file_initialized = True
+                    
+                    # Write data row to CSV
+                    csv_values = [str(log_data.get(key, '')) for key in csv_header]
+                    with open(log_csv, 'a') as f:
+                        f.write(','.join(csv_values) + '\n')
                 
                 # Save checkpoint
-                if (i + 1) % save_interval == 0:
+                if success_count % save_interval == 0:
                     epoch = i // len(dataloader)
                     self.save_checkpoint(
                         save_dir=save_dir,
                         epoch=epoch,
                         step=i + 1
                     )
+            
+        # Print final newline to complete progress output
+        print()  # Newline after progress bar
         
         # Final checkpoint
         final_epoch = num_iters // len(dataloader)
         self.save_checkpoint(save_dir=save_dir, epoch=final_epoch, step=num_iters)
-        print(f"Training completed! Final checkpoint saved to {save_dir}")
+        
+        # Write completion message to log file
+        completion_msg = f"Training completed! Final checkpoint saved to {save_dir}"
+        with open(log_file, 'a') as f:
+            f.write(completion_msg + '\n')
     
     def save_checkpoint(self, save_dir: str, epoch: int, step: int):
         """Save model checkpoint"""
@@ -577,7 +763,6 @@ class StarGANTrainer:
         }
         
         torch.save(checkpoint, checkpoint_path)
-        print(f"Checkpoint saved to {checkpoint_path}")
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint"""
@@ -591,7 +776,6 @@ class StarGANTrainer:
         epoch = checkpoint['epoch']
         step = checkpoint['step']
         
-        print(f"Loaded checkpoint from {checkpoint_path} (Epoch {epoch}, Step {step})")
         return epoch, step
 
 
@@ -610,7 +794,8 @@ def main():
     
     # Training hyperparameters (from main.py)
     parser.add_argument('--batch_size', type=int, default=1, help='mini-batch size')
-    parser.add_argument('--num_iters', type=int, default=200000, help='number of total iterations for training D')
+    parser.add_argument('--num_epochs', type=int, default=1, help='number of total epochs for training D')
+    parser.add_argument('--num_iters', type=int, default=None, help='number of total iterations for training D')
     parser.add_argument('--num_iters_decay', type=int, default=100000, help='number of iterations for decaying lr')
     parser.add_argument('--g_lr', type=float, default=0.0001, help='learning rate for G')
     parser.add_argument('--d_lr', type=float, default=0.0001, help='learning rate for D')
@@ -623,8 +808,18 @@ def main():
     parser.add_argument('--temperature', type=float, default=1.15, help='temperature for sampling method')
     parser.add_argument('--resume_iters', type=int, default=None, help='resume training from this step')
     
+    # Sliding window parameters for handling sequences longer than Amadeus max input length
+    parser.add_argument('--window_size', type=int, default=3072//3, 
+                       help='sliding window size (default: 3072, Amadeus max input length)')
+    parser.add_argument('--window_stride', type=int, default=3072//6,
+                       help='sliding window stride (default: None = window_size, no overlap)')
+    parser.add_argument('--window_aggregation', type=str, default='mean',
+                       choices=['mean', 'max', 'first'],
+                       help='aggregation method for window outputs: mean (average), max (maximum), first (first window only)')
+    
     # Data and I/O (from main.py)
-    model_name = 'MidiCaps-v0'
+    now_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+    model_name = f'MidiCaps-{now_time}'
     parser.add_argument('--score_dir', type=str, default='../Amadeus/dataset/MidiCaps/corpus/tuneidx_', help='Training data directory')
     parser.add_argument('--attr_path', type=str, default='../Dataset/MidiCaps/train.json', help='Attribute path')
     parser.add_argument('--vocab_path', type=str, default='../Amadeus/models/Amadeus-S/files/checkpoints/vocab_LakhALLFined_nb8.json', help='Vocabulary path')
@@ -677,7 +872,10 @@ def main():
         lambda_gp=args.lambda_gp,
         n_critic=args.n_critic,
         temperature=args.temperature,
-        device=args.device
+        device=args.device,
+        window_size=args.window_size,
+        window_stride=args.window_stride,
+        window_aggregation=args.window_aggregation
     )
     
     print(f"Configuration:")
@@ -685,13 +883,17 @@ def main():
     print(f"  Discriminator model: {args.d_modelpath}")
     print(f"  Discriminator config: {args.d_configpath}")
     print(f"  Batch size: {args.batch_size}")
-    print(f"  Number of iterations: {args.num_iters}")
+    #print(f"  Number of iterations: {args.num_iters}")
     print(f"  Generator LR: {args.g_lr}")
     print(f"  Discriminator LR: {args.d_lr}")
     print(f"  Number of domains: {len(args.selected_attrs)}")
     print(f"  Score directory: {args.score_dir}")
     print(f"  Attribute path: {args.attr_path}")
     print(f"  Model save directory: {args.model_save_dir}")
+    print(f"  Sliding Window Configuration:")
+    print(f"    Window size: {args.window_size}")
+    print(f"    Window stride: {args.window_stride if args.window_stride is not None else 'None (default to window_size)'}")
+    print(f"    Aggregation method: {args.window_aggregation}")
     
     # Create dataloader from args.score_dir and args.attr_path
     print("\nCreating dataloader...")
@@ -714,17 +916,20 @@ def main():
         num_workers=args.num_workers
     )
     
+    if args.num_iters is None:
+        args.num_iters = len(dataloader)
+    
     print(f"Dataloader created successfully!")
     print(f"  Number of batches: {len(dataloader)}")
-    
-    # Start training with num_iters (not num_epochs)
     print(f"  Training iterations: {args.num_iters}")
     
     # Start training
     trainer.train(
         dataloader=dataloader,
+        num_epochs=args.num_epochs,
         num_iters=args.num_iters,
         save_dir=args.model_save_dir,
+        log_dir=args.log_dir,
         log_interval=args.log_step,
         save_interval=args.model_save_step
     )
