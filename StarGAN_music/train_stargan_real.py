@@ -29,6 +29,7 @@ from Amadeus.train_utils import adjust_prediction_order
 from Amadeus.evaluation_utils import wandb_style_config_to_omega_config
 from data_representation import vocab_utils
 from transformers import LlamaForSequenceClassification, LlamaConfig, T5Tokenizer, T5EncoderModel
+from src.llama_recipes.real_finetuning_player_classification import LlamaForSequenceDoubleClassification
 
 # Import loss functions
 from stargan_losses import compute_discriminator_loss, compute_generator_loss
@@ -379,7 +380,8 @@ class StarGANTrainer:
         llama_config.num_labels = num_domains
         
         # Create model
-        model = LlamaForSequenceClassification(llama_config)
+        #model = LlamaForSequenceClassification(llama_config)
+        model = LlamaForSequenceDoubleClassification(llama_config)
         
         # Load checkpoint
         model_checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -809,9 +811,9 @@ def main():
     parser.add_argument('--resume_iters', type=int, default=None, help='resume training from this step')
     
     # Sliding window parameters for handling sequences longer than Amadeus max input length
-    parser.add_argument('--window_size', type=int, default=3072//3, 
+    parser.add_argument('--window_size', type=int, default=2048,#3072//3, 
                        help='sliding window size (default: 3072, Amadeus max input length)')
-    parser.add_argument('--window_stride', type=int, default=3072//6,
+    parser.add_argument('--window_stride', type=int, default=3072//3,
                        help='sliding window stride (default: None = window_size, no overlap)')
     parser.add_argument('--window_aggregation', type=str, default='mean',
                        choices=['mean', 'max', 'first'],

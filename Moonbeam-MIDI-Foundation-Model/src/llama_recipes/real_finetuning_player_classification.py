@@ -61,6 +61,80 @@ from llama_recipes.utils.train_utils import (
 )
 from accelerate.utils import is_xpu_available
 
+LLAMA_INPUTS_DOCSTRING = r"""
+    Args:
+        input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+            Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
+            it.
+
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            [`PreTrainedTokenizer.__call__`] for details.
+
+            [What are input IDs?](../glossary#input-ids)
+        attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
+
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
+
+            [What are attention masks?](../glossary#attention-mask)
+
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            [`PreTrainedTokenizer.__call__`] for details.
+
+            If `past_key_values` is used, optionally only the last `input_ids` have to be input (see
+            `past_key_values`).
+
+            If you want to change padding behavior, you should read [`modeling_opt._prepare_decoder_attention_mask`]
+            and modify to your needs. See diagram 1 in [the paper](https://arxiv.org/abs/1910.13461) for more
+            information on the default strategy.
+
+            - 1 indicates the head is **not masked**,
+            - 0 indicates the head is **masked**.
+        position_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Indices of positions of each input sequence tokens in the position embeddings. Selected in the range `[0,
+            config.n_positions - 1]`.
+
+            [What are position IDs?](../glossary#position-ids)
+        past_key_values (`Cache` or `tuple(tuple(torch.FloatTensor))`, *optional*):
+            Pre-computed hidden-states (key and values in the self-attention blocks and in the cross-attention
+            blocks) that can be used to speed up sequential decoding. This typically consists in the `past_key_values`
+            returned by the model at a previous stage of decoding, when `use_cache=True` or `config.use_cache=True`.
+
+            Two formats are allowed:
+            - a [`~cache_utils.Cache`] instance;
+            - Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of
+            shape `(batch_size, num_heads, sequence_length, embed_size_per_head)`). This is also known as the legacy
+            cache format.
+
+            The model will output the same cache format that is fed as input. If no `past_key_values` are passed, the
+            legacy cache format will be returned.
+
+            If `past_key_values` are used, the user can optionally input only the last `input_ids` (those that don't
+            have their past key value states given to this model) of shape `(batch_size, 1)` instead of all `input_ids`
+            of shape `(batch_size, sequence_length)`.
+        inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+            Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
+            is useful if you want more control over how to convert `input_ids` indices into associated vectors than the
+            model's internal embedding lookup matrix.
+        use_cache (`bool`, *optional*):
+            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
+            `past_key_values`).
+        output_attentions (`bool`, *optional*):
+            Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
+            tensors for more detail.
+        output_hidden_states (`bool`, *optional*):
+            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
+            more detail.
+        return_dict (`bool`, *optional*):
+            Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence. Contrarily to `position_ids`,
+            this tensor is not affected by padding. It is used to update the cache in the correct position and to infer
+            the complete sequence length.
+"""
+
+
 """カスタムモデルの出力クラス"""
 from transformers.utils import ModelOutput
 from dataclasses import dataclass
@@ -84,7 +158,7 @@ class DoubleClassifierOutputWithPast(ModelOutput):
 """ソース真偽判定用線形層追加モデル"""
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from transformers.models.llama.modeling_llama import LLAMA_INPUTS_DOCSTRING
+#from transformers.models.llama.modeling_llama import LLAMA_INPUTS_DOCSTRING
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.utils import add_start_docstrings_to_model_forward
 from transformers.cache_utils import Cache
@@ -98,8 +172,10 @@ class LlamaForSequenceDoubleClassification(
         self.num_labels = config.num_labels
         self.model = LlamaModel(config)
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+        
         # 追加: 真偽分類用線形層
         self.real_fake_score = nn.Linear(config.hidden_size, 2, bias=False)
+        
         self.model.classification_token_embedding = torch.nn.Embedding(1, config.hidden_size)
         self.model.classification_token_embedding.requires_grad = True
         # Initialize weights and apply final processing
@@ -152,30 +228,39 @@ class LlamaForSequenceDoubleClassification(
         # 追加: 真偽分類スコア
         real_fake_logits = self.real_fake_score(hidden_states)
 
+        if input_ids is not None:
+            batch_size = input_ids.shape[0]
+        else:
+            batch_size = inputs_embeds.shape[0]
 
-        where_eos = (input_ids[..., 0] == self.classification_token)  # Shape: (batch_size, seq_len)
-        # Use `where_eos` to extract logits
-        batch_indices, seq_indices = where_eos.nonzero(as_tuple=True)  # Get batch and sequence indices # get position-1 before the EOS token
-
-        # Gather logits
-        pooled_logits = logits[batch_indices, seq_indices]  # Shape: (num_eos_positions, hidden_dim) , because it might learn just to turn off the sequence
-        # 追加: 真偽分類用logits抽出
-        pooled_real_fake_logits = real_fake_logits[batch_indices, seq_indices]
-        
-        loss = None
-        if labels is not None:
-            labels = labels[batch_indices, seq_indices].to(logits.device)
-            
-            # 追加: 真偽分類用loss計算
-            loss_fct = CrossEntropyLoss()
-            real_fake_loss = loss_fct(pooled_real_fake_logits.view(-1, 2), labels.view(-1)) #TODO: add weighting param since there might be an arbitrary number of labels here
-            number_of_labels = where_eos.sum()
-            if number_of_labels ==0:
-                real_fake_loss = torch.tensor(0., requires_grad=True).to(pooled_real_fake_logits)
+        if self.config.pad_token_id is None and batch_size != 1:
+            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+        if self.config.pad_token_id is None:
+            sequence_lengths = -1
+        else:
+            if input_ids is not None:
+                # if no pad token found, use modulo instead of reverse indexing for ONNX compatibility
+                sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
+                sequence_lengths = sequence_lengths % input_ids.shape[-1]
+                sequence_lengths = sequence_lengths.to(logits.device)
             else:
-                # loss = loss/number_of_labels
-                real_fake_loss = real_fake_loss
+                sequence_lengths = -1
+
+        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
+        pooled_real_fake_logits = real_fake_logits[torch.arange(batch_size, device=real_fake_logits.device), sequence_lengths]
+
+        real_fake_loss = 0
+        classification_loss = 0
+        if labels is not None:
+            labels = labels.to(logits.device)
+            # Real/fake classification loss
+            loss_fct = MSELoss()
+            if self.num_labels == 1:
+                real_fake_loss = loss_fct(pooled_real_fake_logits.squeeze(), labels.squeeze())
+            else:
+                real_fake_loss = loss_fct(pooled_real_fake_logits, labels)
             
+            # Classification loss
             if self.config.problem_type is None:
                 if self.num_labels == 1:
                     self.config.problem_type = "regression"
@@ -192,17 +277,11 @@ class LlamaForSequenceDoubleClassification(
                     classification_loss = loss_fct(pooled_logits, labels)
             elif self.config.problem_type == "single_label_classification":
                 loss_fct = CrossEntropyLoss()
-                classification_loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1)) #TODO: add weighting param since there might be an arbitrary number of labels here
-                number_of_labels = where_eos.sum()
-                if number_of_labels ==0:
-                    classification_loss = torch.tensor(0., requires_grad=True).to(pooled_logits)
-                else:
-                    # classification_loss = classification_loss/number_of_labels
-                    classification_loss = classification_loss
+                classification_loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
             elif self.config.problem_type == "multi_label_classification":
                 loss_fct = BCEWithLogitsLoss()
                 classification_loss = loss_fct(pooled_logits, labels)
-        
+                
         total_loss = classification_loss + real_fake_loss
         
         if not return_dict:
