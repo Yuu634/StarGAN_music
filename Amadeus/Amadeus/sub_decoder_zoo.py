@@ -5,6 +5,7 @@ from sympy import Trace, false, true
 import torch
 import torch.profiler
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from x_transformers import Decoder
 
@@ -621,6 +622,12 @@ class CrossAttention(SubDecoderClass):
     if target is None:
       sampled_token_dict = {}
       memory_tensor = torch.cat(memory_list, dim=1) # (B*T) x 1 x d_model
+      device = input_seq_pos.device
+      
+      # Phase 1: Ensure memory is on same device as input_seq_pos
+      if memory_tensor.device != device:
+          memory_tensor = memory_tensor.to(device)
+      
       old_memory_tensor = memory_tensor
       for idx, feature in enumerate(self.prediction_order):
         feature_pos = self.feature_order_in_output[feature]
@@ -628,7 +635,11 @@ class CrossAttention(SubDecoderClass):
           input_dict = {'input_seq': memory_tensor, 'memory': window_applied_hidden_vec[-1:]}
           input_dict = self.feature_enricher_layers(input_dict)
           memory_tensor = input_dict['input_seq']
-        CA_attn_mask = generate_CA_mask(input_seq_pos.shape[1], memory_tensor.shape[1]).to(self.device)
+          # Re-sync device after enricher
+          if memory_tensor.device != device:
+              memory_tensor = memory_tensor.to(device)
+        
+        CA_attn_mask = generate_CA_mask(input_seq_pos.shape[1], memory_tensor.shape[1]).to(device)
         input_dict = {'input_seq': input_seq_pos[-1:], 'memory': memory_tensor, 'memory_mask': CA_attn_mask}
         input_dict = self.sub_decoder_layers(input_dict)
         attn_output = input_dict['input_seq']
@@ -647,11 +658,25 @@ class CrossAttention(SubDecoderClass):
     
     # ---- Training ---- #
     memory_tensor = self._prepare_token_embedding_for_teacher_forcing(memory_list, target) # (B*T) x (BOS + num_sub_tokens-1) x d_model
+    
+    # Phase 1: Ensure all tensors are on the same device (critical for multi-GPU + AMP)
+    device = input_seq_pos.device
+    if memory_tensor.device != device:
+        memory_tensor = memory_tensor.to(device)
+    if hasattr(self, 'causal_ca_mask') and self.causal_ca_mask is not None:
+        if self.causal_ca_mask.device != device:
+            self.causal_ca_mask = self.causal_ca_mask.to(device)
+    
     # apply feature enricher to memory
     if self.sub_decoder_enricher_use:
       input_dict = {'input_seq': memory_tensor, 'memory': window_applied_hidden_vec}
       input_dict = self.feature_enricher_layers(input_dict)
       memory_tensor = input_dict['input_seq'] # (B*T) x num_sub_tokens x d_model
+      
+      # Re-sync device after feature enricher
+      if memory_tensor.device != device:
+          memory_tensor = memory_tensor.to(device)
+    
     # implement sub decoder cross attention
     input_dict = {'input_seq': input_seq_pos, 'memory': memory_tensor, 'memory_mask': self.causal_ca_mask}
     input_dict = self.sub_decoder_layers(input_dict)
@@ -755,8 +780,38 @@ class DiffusionDecoder(SubDecoderClass):
       self.sub_decoder_layers = nn.Sequential(TransformerLayer(dim=dim, num_heads=heads, dropout=dropout))
     if sub_decoder_enricher_use:
       self.feature_enricher_layers = nn.Sequential(FeatureEnricher(dim=dim, num_heads=heads, dropout=dropout))
+    
+    # Enable gradient checkpointing by default for memory efficiency
+    self.gradient_checkpointing_enabled = True
 
   
+  # Gradient checkpointing helper function for sub_decoder_layers forward pass
+  def _sub_decoder_forward_checkpoint(self, input_seq, memory, memory_mask):
+    """
+    Wrapper for sub_decoder_layers forward pass to be used with gradient checkpointing.
+    Args:
+      input_seq: (B*T) x num_sub_tokens x d_model
+      memory: (B*T) x num_sub_tokens x d_model  
+      memory_mask: attention mask
+    Returns:
+      output: dict with 'input_seq' key containing output tensor
+    """
+    input_dict = {'input_seq': input_seq, 'memory': memory, 'memory_mask': memory_mask}
+    return self.sub_decoder_layers(input_dict)
+  
+  # Gradient checkpointing helper function for feature_enricher_layers forward pass
+  def _feature_enricher_forward_checkpoint(self, input_seq, memory):
+    """
+    Wrapper for feature_enricher_layers forward pass to be used with gradient checkpointing.
+    Args:
+      input_seq: (B*T) x num_sub_tokens x d_model
+      memory: (B*T) x window_size x d_model
+    Returns:
+      output: dict with 'input_seq' key containing output tensor
+    """
+    input_dict = {'input_seq': input_seq, 'memory': memory}
+    return self.feature_enricher_layers(input_dict)
+
   # simplified version of the forward process in diffusion model
   def _forward_process(self, input_ids, eps=1e-3, mask_idx=None):
     reshaped_input_ids = torch.reshape(input_ids, (-1, input_ids.shape[-1])) # B*T x num_sub_tokens
@@ -1264,12 +1319,33 @@ class DiffusionDecoder(SubDecoderClass):
     # memory_tensor = self.layer_norm(memory_tensor)
     # apply feature enricher to memory
     if self.sub_decoder_enricher_use:
-      input_dict = {'input_seq': memory_tensor, 'memory': window_applied_hidden_vec}
-      input_dict = self.feature_enricher_layers(input_dict)
+      if self.gradient_checkpointing_enabled and self.training:
+        # Use gradient checkpointing to reduce memory usage
+        input_dict = checkpoint(
+          self._feature_enricher_forward_checkpoint,
+          memory_tensor,
+          window_applied_hidden_vec,
+          use_reentrant=False
+        )
+      else:
+        input_dict = {'input_seq': memory_tensor, 'memory': window_applied_hidden_vec}
+        input_dict = self.feature_enricher_layers(input_dict)
       memory_tensor = input_dict['input_seq'] # (B*T) x num_sub_tokens x d_model
     # implement sub decoder cross attention
-    input_dict = {'input_seq': memory_tensor, 'memory': input_seq_pos, 'memory_mask': self.causal_ca_mask}
-    input_dict = self.sub_decoder_layers(input_dict)
+    # Phase 1: Temporarily disable gradient checkpoint to fix shape issues with multi-GPU + AMP
+    # Gradient checkpoint can cause shape issues when dict inputs are flattened
+    if False and self.gradient_checkpointing_enabled and self.training:
+      # Use gradient checkpointing to reduce memory usage during attention
+      input_dict = checkpoint(
+        self._sub_decoder_forward_checkpoint,
+        memory_tensor,
+        input_seq_pos,
+        self.causal_ca_mask,
+        use_reentrant=False
+      )
+    else:
+      input_dict = {'input_seq': input_seq_pos, 'memory': memory_tensor, 'memory_mask': self.causal_ca_mask}
+      input_dict = self.sub_decoder_layers(input_dict)
     attn_output = input_dict['input_seq'] # (B*T) x num_sub_tokens x d_model
     # get prob
     for idx, feature in enumerate(self.prediction_order):

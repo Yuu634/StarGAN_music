@@ -76,7 +76,25 @@ class ResidualLayerNormModule(nn.Module):
       self.layer_norm = nn.LayerNorm(self.submodule.input_size)
 
   def forward_attention(self, q, k, v, attn_mask, type):
+    # Phase 1: Ensure all tensors are on the same device (critical for multi-GPU + AMP)
+    device = q.device
+    if k.device != device:
+        k = k.to(device)
+    if v.device != device:
+        v = v.to(device)
+    if attn_mask is not None and attn_mask.device != device:
+        attn_mask = attn_mask.to(device)
+    
     attn_output, _ = self.submodule(q, k, v, attn_mask=attn_mask, need_weights=False, average_attn_weights=False)
+    
+    # Phase 1: Verify output shape matches input for residual connection
+    if attn_output.shape != q.shape:
+        raise RuntimeError(
+            f"Shape mismatch in forward_attention residual connection: "
+            f"attn_output shape {attn_output.shape} != q shape {q.shape}. "
+            f"This indicates a shape transformation issue in MultiheadAttention."
+        )
+    
     return self.layer_norm(attn_output + q)
 
   def forward_mlp(self, x):
