@@ -174,7 +174,7 @@ class LlamaForSequenceDoubleClassification(
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
         
         # 追加: 真偽分類用線形層
-        self.real_fake_score = nn.Linear(config.hidden_size, 2, bias=False)
+        self.real_fake_score = nn.Linear(config.hidden_size, 1, bias=False)
         
         self.model.classification_token_embedding = torch.nn.Embedding(1, config.hidden_size)
         self.model.classification_token_embedding.requires_grad = True

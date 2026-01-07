@@ -422,7 +422,9 @@ class StarGANTrainer:
         real_scores: torch.Tensor,  # [B, T, 8] Amadeus format
         target_context: torch.Tensor,  # [B, T_text, H] Target text embedding
         original_context: torch.Tensor,  # [B, T_text, H] Original text embedding
-        real_labels: torch.Tensor  # [B, 108] Original domain labels for discriminator loss
+        real_labels: torch.Tensor,  # [B, 108] Original domain labels
+        target_labels: torch.Tensor,  # [B, 108] Target domain labels
+        n_success: int = 0
     ):
         """
         Single training step
@@ -469,33 +471,32 @@ class StarGANTrainer:
         g_loss_val = 0.0
         g_logs = {}
         
-        # Note: This simplified version trains G every step
-        # In full implementation, use iteration counter to train every n_critic steps
-        
-        self.g_optimizer.zero_grad()
-        
-        g_loss, g_logs = compute_generator_loss(
-            G=self.G,
-            D=self.D,
-            real_scores=real_scores,
-            context=target_context,
-            original_context=original_context,
-            projection_layer=self.projection_layer,
-            vocab_size_list=self.vocab_size_list,
-            hidden_size=self.D.config.hidden_size,
-            embedding_layers=self.embedding_layers,
-            emb_size=self.emb_size,
-            lambda_cls=self.lambda_cls,
-            lambda_rec=self.lambda_rec,
-            temperature=self.temperature,
-            device=self.device_g
-        )
-        
-        g_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.G.parameters(), max_norm=1.0)
-        self.g_optimizer.step()
-        
-        g_loss_val = g_loss.item()
+        if (n_success + 1) % self.n_critic == 0:
+            self.g_optimizer.zero_grad()
+            
+            g_loss, g_logs = compute_generator_loss(
+                G=self.G,
+                D=self.D,
+                real_scores=real_scores,
+                context=target_context,
+                target_labels=target_labels,
+                original_context=original_context,
+                projection_layer=self.projection_layer,
+                vocab_size_list=self.vocab_size_list,
+                hidden_size=self.D.config.hidden_size,
+                embedding_layers=self.embedding_layers,
+                emb_size=self.emb_size,
+                lambda_cls=self.lambda_cls,
+                lambda_rec=self.lambda_rec,
+                temperature=self.temperature,
+                device=self.device_g
+            )
+            
+            g_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.G.parameters(), max_norm=1.0)
+            self.g_optimizer.step()
+            
+            g_loss_val = g_loss.item()
         
         # Combine logs
         logs = {**d_logs, **g_logs}
@@ -589,6 +590,9 @@ class StarGANTrainer:
                 
                 # Generate random target domain (different from original)
                 target_domain_idx = torch.randint(0, self.num_domains, (B,), device=self.device).tolist()
+                target_labels = torch.zeros(B, self.num_domains, dtype=torch.bool)
+                target_labels.scatter_(1, torch.tensor(target_domain_idx).unsqueeze(1), True)
+                target_labels = target_labels.to(self.device)
                 
                 # Create text prompts from domain indices with selected_attrs
                 # Convert tensor indices to list for indexing self.selected_attrs
@@ -643,7 +647,9 @@ class StarGANTrainer:
                                 real_scores=window_batch,
                                 target_context=target_context,
                                 original_context=original_context,
-                                real_labels=original_labels
+                                real_labels=original_labels,
+                                target_labels=target_labels,
+                                n_success=success_count
                             )
                             
                             # Store window output (we'll aggregate after all windows)
@@ -698,7 +704,7 @@ class StarGANTrainer:
                 progress_str = f"Progress: {i+1}/{num_iters} ({progress_percent:.1f}%) | Success: {success_count} | Failure: {failure_count}"
                 print(progress_str, end='\r')
                 #if train_success:
-                if success_count % log_interval == 0:
+                if (success_count % log_interval == 0) and (success_count > 0):
                     # Prepare log data
                     log_data = {
                         'epoch': epoch + 1,
@@ -804,16 +810,16 @@ def main():
     parser.add_argument('--lambda_cls', type=float, default=1, help='weight for domain classification loss')
     parser.add_argument('--lambda_rec', type=float, default=10, help='weight for reconstruction loss')
     parser.add_argument('--lambda_gp', type=float, default=10, help='weight for gradient penalty')
-    parser.add_argument('--n_critic', type=int, default=5, help='number of D updates per each G update')
+    parser.add_argument('--n_critic', type=int, default=2, help='number of D updates per each G update')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for Adam optimizer')
     parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam optimizer')
     parser.add_argument('--temperature', type=float, default=1.15, help='temperature for sampling method')
     parser.add_argument('--resume_iters', type=int, default=None, help='resume training from this step')
     
     # Sliding window parameters for handling sequences longer than Amadeus max input length
-    parser.add_argument('--window_size', type=int, default=2048,#3072//3, 
+    parser.add_argument('--window_size', type=int, default=1024,
                        help='sliding window size (default: 3072, Amadeus max input length)')
-    parser.add_argument('--window_stride', type=int, default=3072//3,
+    parser.add_argument('--window_stride', type=int, default=512,
                        help='sliding window stride (default: None = window_size, no overlap)')
     parser.add_argument('--window_aggregation', type=str, default='mean',
                        choices=['mean', 'max', 'first'],

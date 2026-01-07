@@ -530,7 +530,9 @@ def compute_discriminator_loss(
     # Use embeddings directly as Discriminator input
     real_cls_output = D(inputs_embeds=real_embeddings)
     
-    # Domain classification loss
+    # Calculation real loss
+    d_loss_real = - torch.mean(real_cls_output.real_fake_logits)
+    
     real_cls_logits = real_cls_output.logits if hasattr(real_cls_output, 'logits') else real_cls_output["logits"]
     d_loss_cls = F.binary_cross_entropy_with_logits(
         real_cls_logits,
@@ -551,21 +553,18 @@ def compute_discriminator_loss(
     # Use embeddings directly as Discriminator input
     fake_cls_output = D(inputs_embeds=fake_embeddings)
     
-    # Fake loss: maximize likelihood that D classifies fake as real domain
-    fake_cls_logits = fake_cls_output.logits if hasattr(fake_cls_output, 'logits') else fake_cls_output["logits"]
-    d_loss_fake = F.binary_cross_entropy_with_logits(
-        fake_cls_logits,
-        real_labels.float()  # Fool D into thinking fake is real
-    ).to(device)
+    # Calculation fake loss
+    d_loss_fake = torch.mean(fake_cls_output.real_fake_logits)
     
     # ========== Gradient Penalty (simplified) ==========
     # For soft embeddings, gradient penalty is less critical
     d_loss_gp = torch.tensor(0.0, device=device)
     
     # ========== Total Discriminator loss ==========
-    d_loss = d_loss_fake + lambda_cls * d_loss_cls + lambda_gp * d_loss_gp
+    d_loss = d_loss_real + d_loss_fake + lambda_cls * d_loss_cls + lambda_gp * d_loss_gp
     
     loss_dict = {
+        'D/loss_real': d_loss_real.item(),
         'D/loss_fake': d_loss_fake.item(),
         'D/loss_cls': d_loss_cls.item(),
         'D/loss_gp': d_loss_gp.item() if isinstance(d_loss_gp, torch.Tensor) else d_loss_gp,
@@ -580,6 +579,7 @@ def compute_generator_loss(
     D,
     real_scores,
     context,
+    target_labels,
     original_context,
     projection_layer,
     vocab_size_list,
@@ -636,16 +636,14 @@ def compute_generator_loss(
     # Use embeddings directly as Discriminator input
     fake_cls_output = D(inputs_embeds=fake_embeddings)
     
-    # Adversarial loss: Generator tries to fool Discriminator
-    fake_cls_logits = fake_cls_output.logits if hasattr(fake_cls_output, 'logits') else fake_cls_output["logits"]
-    # For adversarial loss, we can use gradient reversal or inverse labels
-    g_loss_adv = F.binary_cross_entropy_with_logits(
-        fake_cls_logits,
-        torch.zeros_like(fake_cls_logits)  # Try to make D think it's original domain
-    ).to(device)
+    # Calculation fake loss
+    g_loss_fake = - torch.mean(fake_cls_output.real_fake_logits)
     
-    # Domain classification loss (skip for now)
-    g_loss_cls = torch.tensor(0.0, device=device)
+    fake_cls_logits = fake_cls_output.logits if hasattr(fake_cls_output, 'logits') else fake_cls_output["logits"]
+    g_loss_cls = F.binary_cross_entropy_with_logits(
+        fake_cls_logits,
+        target_labels.float()
+    ).to(device)
     
     # ========== Convert fake_logits to discrete tokens (DIFFERENTIABLE via Gumbel-Softmax) ==========
     # Use Gumbel-Softmax for more stable and reliable gradient flow
@@ -681,10 +679,10 @@ def compute_generator_loss(
     g_loss_rec = g_loss_rec / len(AMADEUS_FIELDS)
     
     # ========== Total Generator loss ==========
-    g_loss = g_loss_adv + lambda_cls * g_loss_cls + lambda_rec * g_loss_rec
+    g_loss = g_loss_fake + lambda_cls * g_loss_cls + lambda_rec * g_loss_rec
     
     loss_dict = {
-        'G/loss_adv': g_loss_adv.item(),
+        'G/loss_fake': g_loss_fake.item(),
         'G/loss_cls': g_loss_cls.item() if isinstance(g_loss_cls, torch.Tensor) else g_loss_cls,
         'G/loss_rec': g_loss_rec.item(),
         'G/loss_total': g_loss.item()
