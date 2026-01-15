@@ -134,65 +134,36 @@ class StarGANTrainer:
     StarGAN Trainer with real Amadeus Generator and Moonbeam Discriminator
     """
     
-    def __init__(
-        self,
-        amadeus_config_path: str,
-        amadeus_checkpoint_path: str,
-        amadeus_vocab_path: str,
-        moonbeam_config_path: str,
-        moonbeam_checkpoint_path: str,
-        num_domains: int = 108,
-        selected_attrs: list = None,
-        g_lr: float = 1e-4,
-        d_lr: float = 1e-4,
-        lambda_cls: float = 1.0,
-        lambda_rec: float = 10.0,
-        lambda_gp: float = 10.0,
-        n_critic: int = 5,
-        temperature: float = 0.5,
-        device: str = 'cuda',
-        use_multi_gpu: bool = True,
-        window_size: int = 3072,
-        window_stride: int = None,
-        window_aggregation: str = 'mean'
-    ):
+    def __init__(self, args):
         """
         Args:
-            amadeus_config_path: Path to Amadeus config YAML
-            amadeus_checkpoint_path: Path to Amadeus checkpoint
-            amadeus_vocab_path: Path to Amadeus vocabulary
-            moonbeam_config_path: Path to Moonbeam config JSON
-            moonbeam_checkpoint_path: Path to Moonbeam checkpoint
-            num_domains: Number of domain labels (default: 108)
-            g_lr: Generator learning rate
-            d_lr: Discriminator learning rate
-            lambda_cls: Domain classification loss weight
-            lambda_rec: Cycle consistency loss weight
-            lambda_gp: Gradient penalty weight
-            n_critic: Discriminator updates per Generator update
-            temperature: Gumbel-Softmax temperature
-            device: Training device
-            use_multi_gpu: Enable multi-GPU model parallelization
-            window_size: Sliding window size (default: 3072, Amadeus max input length)
-            window_stride: Sliding window stride (default: None = no overlap)
-            window_aggregation: Method to aggregate window outputs ('mean', 'max', 'first')
+            args: Configuration object containing all training parameters
         """
-        self.device = device
-        self.num_domains = num_domains
-        self.selected_attrs = selected_attrs
-        self.lambda_cls = lambda_cls
-        self.lambda_rec = lambda_rec
-        self.lambda_gp = lambda_gp
-        self.n_critic = n_critic
-        self.temperature = temperature
-        self.vocab_path = amadeus_vocab_path  # Save vocab path for loss functions
-        self.use_multi_gpu = use_multi_gpu
-        self.window_size = window_size
-        self.window_stride = window_stride if window_stride is not None else window_size
-        self.window_aggregation = window_aggregation
+        self.g_modelpath = args.g_modelpath
+        self.amadeus_checkpoint = args.amadeus_checkpoint
+        self.vocab_path = args.vocab_path
+        self.d_configpath = args.d_configpath
+        self.d_modelpath = args.d_modelpath
+        self.num_domains = len(args.selected_attrs)
+        self.selected_attrs = args.selected_attrs
+        self.g_lr = args.g_lr
+        self.d_lr = args.d_lr
+        self.lambda_cls = args.lambda_cls
+        self.lambda_rec = args.lambda_rec
+        self.lambda_gp_init = args.lambda_gp  # Store initial value
+        self.lambda_gp = args.lambda_gp
+        self.g_interval = args.g_interval
+        self.d_interval = args.d_interval
+        self.temperature = args.temperature
+        self.device = args.device
+        self.window_size = args.window_size
+        self.window_stride = args.window_stride if args.window_stride is not None else args.window_size
+        self.window_aggregation = args.window_aggregation
+        self.use_multi_gpu = True  # Default value
+        self.Is_AmadeusRegressive = args.Is_AmadeusRegressive
         
         # Multi-GPU device setup
-        if use_multi_gpu and torch.cuda.device_count() >= 3:
+        if self.use_multi_gpu and torch.cuda.device_count() >= 3:
             self.device_g = 'cuda:0'  # Generator GPU 0
             self.device_d = 'cuda:1'  # Discriminator GPU 1
             self.device_t5 = 'cuda:0'  # T5 encoder on GPU 0
@@ -202,10 +173,10 @@ class StarGANTrainer:
             print(f"  T5 Encoder: GPU 0")
             print(f"  Total GPUs available: {torch.cuda.device_count()}")
         else:
-            self.device_g = device
-            self.device_d = device
-            self.device_t5 = device
-            print(f"\n[Single GPU Setup] Using device: {device}")
+            self.device_g = self.device
+            self.device_d = self.device
+            self.device_t5 = self.device
+            print(f"\n[Single GPU Setup] Using device: {self.device}")
         
         # OOM handling state
         self.current_batch_size = None
@@ -215,18 +186,18 @@ class StarGANTrainer:
         # Load Amadeus Generator (from model_zoo.py)
         print("Loading Amadeus Generator...")
         self.G, self.vocab, self.nn_params = self._load_amadeus_model(
-            config_path=amadeus_config_path,
-            checkpoint_path=amadeus_checkpoint_path,
-            vocab_path=amadeus_vocab_path,
+            config_path=self.g_modelpath,
+            checkpoint_path=self.amadeus_checkpoint,
+            vocab_path=self.vocab_path,
             device=self.device_g
         )
         
         # Load Moonbeam Discriminator (LlamaForSequenceClassification)
         print("Loading Moonbeam Discriminator...")
         self.D = self._load_moonbeam_model(
-            config_path=moonbeam_config_path,
-            checkpoint_path=moonbeam_checkpoint_path,
-            num_domains=num_domains,
+            config_path=self.d_configpath,
+            checkpoint_path=self.d_modelpath,
+            num_domains=self.num_domains,
             device=self.device_d
         )
         
@@ -304,8 +275,8 @@ class StarGANTrainer:
             g_params = list(self.G.parameters()) + list(self.embedding_layers.parameters())
         d_params = list(self.D.parameters()) + list(self.projection_layer.parameters())
         
-        self.g_optimizer = optim.Adam(g_params, lr=g_lr, betas=(0.5, 0.999))
-        self.d_optimizer = optim.Adam(d_params, lr=d_lr, betas=(0.5, 0.999))
+        self.g_optimizer = optim.Adam(g_params, lr=self.g_lr, betas=(0.5, 0.999))
+        self.d_optimizer = optim.Adam(d_params, lr=self.d_lr, betas=(0.5, 0.999))
         
         print("StarGAN Trainer initialized successfully!")
         print(f"Generator parameters: {sum(p.numel() for p in self.G.parameters()):,}")
@@ -332,10 +303,11 @@ class StarGANTrainer:
         )
         
         # Get prediction order
-        prediction_order = adjust_prediction_order(
-            encoding_scheme, num_features, 
-            config.data_params.first_pred_feature, nn_params
-        )
+        #prediction_order = adjust_prediction_order(
+        #    encoding_scheme, num_features, 
+        #    config.data_params.first_pred_feature, nn_params
+        #)
+        prediction_order = ["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"]
         
         # Create AmadeusModel
         model = getattr(model_zoo, nn_params.model_name)(
@@ -352,6 +324,7 @@ class StarGANTrainer:
             heads=nn_params.main_decoder.num_head,
             depth=nn_params.main_decoder.num_layer,
             dropout=nn_params.model_dropout,
+            is_regressive=self.Is_AmadeusRegressive
         )
         
         # Load checkpoint if provided
@@ -384,23 +357,24 @@ class StarGANTrainer:
         model = LlamaForSequenceDoubleClassification(llama_config)
         
         # Load checkpoint
-        model_checkpoint = torch.load(checkpoint_path, map_location=device)
-        checkpoint = model_checkpoint.get('model_state_dict', model_checkpoint)
-        
-        # Remove 'module.' prefix if exists
-        new_state_dict = {}
-        for k, v in checkpoint.items():
-            if k.startswith('module.'):
-                new_state_dict[k[7:]] = v
-            else:
-                new_state_dict[k] = v
-        
-        # Load state dict
-        missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
-        if missing_keys:
-            print(f"Missing keys: {missing_keys[:5]}...")  # Show first 5
-        if unexpected_keys:
-            print(f"Unexpected keys: {unexpected_keys[:5]}...")  # Show first 5
+        if (checkpoint_path is not None) and (os.path.isfile(checkpoint_path)):
+            model_checkpoint = torch.load(checkpoint_path, map_location=device)
+            checkpoint = model_checkpoint.get('model_state_dict', model_checkpoint)
+            
+            # Remove 'module.' prefix if exists
+            new_state_dict = {}
+            for k, v in checkpoint.items():
+                if k.startswith('module.'):
+                    new_state_dict[k[7:]] = v
+                else:
+                    new_state_dict[k] = v
+            
+            # Load state dict
+            missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
+            if missing_keys:
+                print(f"Missing keys: {missing_keys[:5]}...")  # Show first 5
+            if unexpected_keys:
+                print(f"Unexpected keys: {unexpected_keys[:5]}...")  # Show first 5
         
         model.to(device)
         # Ensure all parameters are float32 for consistent dtype throughout the model
@@ -416,6 +390,47 @@ class StarGANTrainer:
         print(f"  Model dtype: {next(model.parameters()).dtype}")
         
         return model
+    
+    def update_lambda_gp(self, current_step: int, total_steps: int, schedule: str = 'linear'):
+        """
+        Update gradient penalty weight based on training schedule
+        
+        Args:
+            current_step: Current training step
+            total_steps: Total training steps
+            schedule: Schedule type ('linear', 'constant', 'warmup', 'cosine')
+        
+        Typical schedules:
+        - 'linear': Linear increase from 0 to lambda_gp_init
+        - 'constant': Keep at lambda_gp_init
+        - 'warmup': Low value initially, ramp to lambda_gp_init at 20% of training
+        - 'cosine': Cosine annealing from lambda_gp_init to 0
+        """
+        progress = current_step / max(total_steps, 1)
+        
+        if schedule == 'linear':
+            # Gradually increase GP weight from 0 to initial value over first 50% of training
+            if progress < 0.5:
+                self.lambda_gp = self.lambda_gp_init * (progress * 2)  # 0 to 1 over first 50%
+            else:
+                self.lambda_gp = self.lambda_gp_init
+        
+        elif schedule == 'warmup':
+            # Keep low during first 20%, then ramp to full
+            if progress < 0.2:
+                self.lambda_gp = self.lambda_gp_init * 0.1  # 10% of initial
+            else:
+                # Linear ramp from 10% to 100% over 20% to 40% of training
+                ramp_progress = min((progress - 0.2) / 0.2, 1.0)
+                self.lambda_gp = self.lambda_gp_init * (0.1 + 0.9 * ramp_progress)
+        
+        elif schedule == 'cosine':
+            # Cosine annealing: high initially, decrease to 0
+            import math
+            self.lambda_gp = self.lambda_gp_init * 0.5 * (1 + math.cos(math.pi * progress))
+        
+        else:  # 'constant'
+            self.lambda_gp = self.lambda_gp_init
     
     def train_step(
         self,
@@ -443,35 +458,39 @@ class StarGANTrainer:
         B, T, _ = real_scores.shape
         
         # ==================== Train Discriminator ====================
-        self.d_optimizer.zero_grad()
+        d_loss_val = 0.0
+        d_logs = {}
         
-        d_loss, d_logs = compute_discriminator_loss(
-            G=self.G,
-            D=self.D,
-            real_scores=real_scores,
-            context=target_context,
-            real_labels=real_labels,
-            projection_layer=self.projection_layer,
-            vocab_size_list=self.vocab_size_list,
-            hidden_size=self.D.config.hidden_size,
-            vocab_path=self.vocab_path,
-            lambda_cls=self.lambda_cls,
-            lambda_gp=self.lambda_gp,
-            temperature=self.temperature,
-            device=self.device_d
-        )
+        if (n_success + 1) % self.d_interval == 0:
+            self.d_optimizer.zero_grad()
+            
+            d_loss, d_logs = compute_discriminator_loss(
+                G=self.G,
+                D=self.D,
+                real_scores=real_scores,
+                context=target_context,
+                real_labels=real_labels,
+                projection_layer=self.projection_layer,
+                vocab_size_list=self.vocab_size_list,
+                hidden_size=self.D.config.hidden_size,
+                vocab_path=self.vocab_path,
+                lambda_cls=self.lambda_cls,
+                lambda_gp=self.lambda_gp,  # Use current value (may be updated by schedule)
+                temperature=self.temperature,
+                device=self.device_d
+            )
         
-        d_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.D.parameters(), max_norm=1.0)
-        self.d_optimizer.step()
+            d_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.D.parameters(), max_norm=1.0)
+            self.d_optimizer.step()
+            
+            d_loss_val = d_loss.item()
         
-        d_loss_val = d_loss.item()
-        
-        # ==================== Train Generator (every n_critic steps) ====================
+        # ==================== Train Generator (every g_interval steps) ====================
         g_loss_val = 0.0
         g_logs = {}
         
-        if (n_success + 1) % self.n_critic == 0:
+        if (n_success + 1) % self.g_interval == 0:
             self.g_optimizer.zero_grad()
             
             g_loss, g_logs = compute_generator_loss(
@@ -503,27 +522,22 @@ class StarGANTrainer:
         
         return d_loss_val, g_loss_val, logs
     
-    def train(
-        self,
-        dataloader: DataLoader,
-        num_epochs: int = 1,
-        num_iters: int = 200000,
-        save_dir: str = './checkpoints',
-        log_dir: str = './logs',
-        log_interval: int = 100,
-        save_interval: int = 1000
-    ):
+    def train(self, args):
         """
         Full training loop (solver.py style with iter/next)
         
         Args:
-            dataloader: Training data loader
-            num_iters: Number of training iterations
-            save_dir: Directory to save checkpoints
-            log_dir: Directory to save training logs
-            log_interval: Steps between logging
-            save_interval: Steps between checkpoint saves
+            args: Configuration object containing training parameters
         """
+        # Extract parameters from args
+        dataloader = args.dataloader
+        num_epochs = args.num_epochs
+        num_iters = args.num_iters
+        save_dir = args.model_save_dir
+        log_dir = args.log_dir
+        log_interval = args.log_step
+        save_interval = args.model_save_step
+        
         os.makedirs(save_dir, exist_ok=True)
         os.makedirs(log_dir, exist_ok=True)
         
@@ -548,6 +562,10 @@ class StarGANTrainer:
             data_iter = iter(dataloader)
             
             for i in range(num_iters):
+                # ===== Update lambda_gp based on schedule =====
+                # Use 'warmup' schedule: low GP weight initially, increase during training
+                self.update_lambda_gp(i, num_iters, schedule='warmup')
+                
                 # Fetch batch data with error handling (solver.py style)
                 try:
                     score, label = next(data_iter)
@@ -709,17 +727,22 @@ class StarGANTrainer:
                     log_data = {
                         'epoch': epoch + 1,
                         'iteration': i + 1,
+                        'lambda_gp': self.lambda_gp,  # Add current GP weight
                         **logs
                     }
                     
                     if self.oom_count > 0:
                         log_data['oom_events'] = self.oom_count
                     
-                    # Write to text log file
+                    # Write to text log file with gradient monitoring
                     log_str = f"Epoch [{log_data['epoch']}/{num_epochs}] | Iteration [{log_data['iteration']}/{num_iters}] | Success: {success_count} | Failure: {failure_count} | "
-                    log_str += ", ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in logs.items()])
+                    log_str += ", ".join([f"{k}: {v:10.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in logs.items()])
                     if self.oom_count > 0:
                         log_str += f", OOM Events: {self.oom_count}"
+                    
+                    # Add gradient monitoring info
+                    if 'D/grad_norm' in logs and 'D/grad_penalty_norm' in logs:
+                        log_str += f" | GradNorm_D: {logs['D/grad_norm']:10.4f} | GradPenalty_avg: {logs['D/grad_penalty_norm']:10.4f}"
                     
                     with open(log_file, 'a') as f:
                         f.write(log_str + '\n')
@@ -790,6 +813,16 @@ class StarGANTrainer:
 def main():
     parser = argparse.ArgumentParser(description='StarGAN Training with Real Models')
     
+    """<Experimental parameters>"""
+    now_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+    #model_name = f'MidiCaps-{now_time}'
+    model_name = 'MidiCaps-Genre-D_interval=10'
+    parser.add_argument('--Is_AmadeusRegressive', type=bool, default=False,
+                        help='Whether to use Amadeus in regressive mode (True/False)')
+    parser.add_argument('--g_interval', type=int, default=1, help='G update interval iterations')
+    parser.add_argument('--d_interval', type=int, default=10, help='D update interval iterations')
+    
+    
     # Model paths (from main.py)
     parser.add_argument('--g_modelpath', type=str, default="../Amadeus/models/Amadeus-S/files/config.yaml", 
                        help='path to the generator config yaml')
@@ -805,12 +838,11 @@ def main():
     parser.add_argument('--num_epochs', type=int, default=1, help='number of total epochs for training D')
     parser.add_argument('--num_iters', type=int, default=None, help='number of total iterations for training D')
     parser.add_argument('--num_iters_decay', type=int, default=100000, help='number of iterations for decaying lr')
-    parser.add_argument('--g_lr', type=float, default=0.0001, help='learning rate for G')
-    parser.add_argument('--d_lr', type=float, default=0.0001, help='learning rate for D')
+    parser.add_argument('--g_lr', type=float, default=0.00005, help='learning rate for G')
+    parser.add_argument('--d_lr', type=float, default=0.00005, help='learning rate for D')
     parser.add_argument('--lambda_cls', type=float, default=1, help='weight for domain classification loss')
-    parser.add_argument('--lambda_rec', type=float, default=10, help='weight for reconstruction loss')
+    parser.add_argument('--lambda_rec', type=float, default=2, help='weight for reconstruction loss')
     parser.add_argument('--lambda_gp', type=float, default=10, help='weight for gradient penalty')
-    parser.add_argument('--n_critic', type=int, default=2, help='number of D updates per each G update')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for Adam optimizer')
     parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam optimizer')
     parser.add_argument('--temperature', type=float, default=1.15, help='temperature for sampling method')
@@ -819,22 +851,19 @@ def main():
     # Sliding window parameters for handling sequences longer than Amadeus max input length
     parser.add_argument('--window_size', type=int, default=1024,
                        help='sliding window size (default: 3072, Amadeus max input length)')
-    parser.add_argument('--window_stride', type=int, default=512,
+    parser.add_argument('--window_stride', type=int, default=1024,
                        help='sliding window stride (default: None = window_size, no overlap)')
     parser.add_argument('--window_aggregation', type=str, default='mean',
                        choices=['mean', 'max', 'first'],
                        help='aggregation method for window outputs: mean (average), max (maximum), first (first window only)')
     
     # Data and I/O (from main.py)
-    now_time = datetime.now().strftime('%Y%m%d_%H%M%S')
-    model_name = f'MidiCaps-{now_time}'
     parser.add_argument('--score_dir', type=str, default='../Amadeus/dataset/MidiCaps/corpus/tuneidx_', help='Training data directory')
     parser.add_argument('--attr_path', type=str, default='../Dataset/MidiCaps/train.json', help='Attribute path')
     parser.add_argument('--vocab_path', type=str, default='../Amadeus/models/Amadeus-S/files/checkpoints/vocab_LakhALLFined_nb8.json', help='Vocabulary path')
+    parser.add_argument('--model_dir', type=str, default=f'output/{model_name}', help='Model directory')
     parser.add_argument('--model_save_dir', type=str, default=f'output/{model_name}/models', help='Checkpoint save directory')
     parser.add_argument('--log_dir', type=str, default=f'output/{model_name}/logs', help='Log directory')
-    parser.add_argument('--sample_dir', type=str, default=f'output/{model_name}/samples', help='Sample directory')
-    parser.add_argument('--result_dir', type=str, default=f'output/{model_name}/results', help='Result directory')
     parser.add_argument('--encoding', type=str, default='nb8', help='Encoding type')
     parser.add_argument('--dataset', type=str, default='MidiCaps', help='Dataset name')
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'], help='Mode')
@@ -842,7 +871,7 @@ def main():
     parser.add_argument('--device', type=str, default='cuda', help='Training device')
     
     # Step sizes (from main.py)
-    parser.add_argument('--log_step', type=int, default=10, help='Log step interval')
+    parser.add_argument('--log_step', type=int, default=100, help='Log step interval')
     parser.add_argument('--sample_step', type=int, default=1000, help='Sample step interval')
     parser.add_argument('--model_save_step', type=int, default=10000, help='Model save step interval')
     parser.add_argument('--lr_update_step', type=int, default=1000, help='Learning rate update step')
@@ -854,37 +883,23 @@ def main():
     
     # Domain labels (from main.py)
     parser.add_argument('--selected_attrs', '--list', nargs='+', help='selected attributes for Music dataset',
-                        default=['funk', 'celtic', 'instrumentalpop', 'ambient', 'reggae', 'popfolk', 'dance', 'rock', 'classical', 'instrumentalrock', 'folk', 'poprock', 'indie', 'hiphop', 'blues', 'experimental', 'punkrock', 'jazz', 'electronic', 'techno', 'jazzfusion', 'pop', 'alternative', 'electropop', 'soundtrack', 'trance', 'house', 'metal', 'world', 'symphonic', 'lounge', 'easylistening', 'orchestral', 'country', 'newage', 'latin', 'drumnbass', '80s', '90s', 'swing', 'chillout', 'synthpop', 'movie', 'christmas', 'heavy', 'corporate', 'action', 'romantic', 'energetic', 'background', 'children', 'calm', 'adventure', 'motivational', 'summer', 'funny', 'dramatic', 'cool', 'positive', 'emotional', 'holiday', 'deep', 'love', 'dark', 'dream', 'advertising', 'happy', 'soundscape', 'film', 'melodic', 'drama', 'uplifting', 'epic', 'ballad', 'sad', 'relaxing', 'party', 'trailer', 'inspiring', 'soft', 'slow', 'game', 'retro', 'fun', 'meditative', 'sport', 'space', 'commercial', 'documentary', 'upbeat', 'Eb major', 'B major', 'Bb major', 'F# minor', 'F# major', 'G# minor', 'A major', 'B minor', 'E minor', 'D minor', 'F minor', 'G minor', 'F major', 'Eb minor', 'C major', 'A minor', 'G major', 'D major', 'C# major', 'Bb minor', 'Ab major', 'C# minor', 'C minor', 'E major'])
+                        default=['chillout', 'electropop', 'latin', 'popfolk', 'classical', 'metal', 'pop', 'poprock', 'drumnbass', 'celtic', 'newage', 'instrumentalpop', 'jazzfusion', 'alternative', 'lounge', 'funk', 'orchestral', 'blues', 'indie', 'house', 'instrumentalrock', 'world', 'trance', 'ambient', '80s', 'dance', 'experimental', 'rock', 'symphonic', 'reggae', 'punkrock', 'jazz', 'easylistening', 'country', 'soundtrack', 'folk', 'electronic', '90s', 'techno', 'hiphop', 'swing', 'synthpop'])
+                        #default=['funk', 'celtic', 'instrumentalpop', 'ambient', 'reggae', 'popfolk', 'dance', 'rock', 'classical', 'instrumentalrock', 'folk', 'poprock', 'indie', 'hiphop', 'blues', 'experimental', 'punkrock', 'jazz', 'electronic', 'techno', 'jazzfusion', 'pop', 'alternative', 'electropop', 'soundtrack', 'trance', 'house', 'metal', 'world', 'symphonic', 'lounge', 'easylistening', 'orchestral', 'country', 'newage', 'latin', 'drumnbass', '80s', '90s', 'swing', 'chillout', 'synthpop', 'movie', 'christmas', 'heavy', 'corporate', 'action', 'romantic', 'energetic', 'background', 'children', 'calm', 'adventure', 'motivational', 'summer', 'funny', 'dramatic', 'cool', 'positive', 'emotional', 'holiday', 'deep', 'love', 'dark', 'dream', 'advertising', 'happy', 'soundscape', 'film', 'melodic', 'drama', 'uplifting', 'epic', 'ballad', 'sad', 'relaxing', 'party', 'trailer', 'inspiring', 'soft', 'slow', 'game', 'retro', 'fun', 'meditative', 'sport', 'space', 'commercial', 'documentary', 'upbeat', 'Eb major', 'B major', 'Bb major', 'F# minor', 'F# major', 'G# minor', 'A major', 'B minor', 'E minor', 'D minor', 'F minor', 'G minor', 'F major', 'Eb minor', 'C major', 'A minor', 'G major', 'D major', 'C# major', 'Bb minor', 'Ab major', 'C# minor', 'C minor', 'E major'])
     
     args = parser.parse_args()
     
     # Create directories if not exist
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.model_save_dir, exist_ok=True)
-    os.makedirs(args.sample_dir, exist_ok=True)
-    os.makedirs(args.result_dir, exist_ok=True)
+    os.makedirs(args.model_dir, exist_ok=True)
+
+    # Save parsed arguments to args.model_dir for reproducibility
+    args_path = Path(args.model_dir) / "args.json"
+    with open(args_path, "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, indent=2)
     
     # Create trainer
-    trainer = StarGANTrainer(
-        amadeus_config_path=args.g_modelpath,  # Use g_modelpath as config path
-        amadeus_checkpoint_path=args.amadeus_checkpoint,
-        amadeus_vocab_path=args.vocab_path,  # Pass vocab_path
-        moonbeam_config_path=args.d_configpath,
-        moonbeam_checkpoint_path=args.d_modelpath,  # Use d_modelpath as checkpoint
-        num_domains=len(args.selected_attrs),  # Number of domains from selected_attrs
-        selected_attrs=args.selected_attrs,
-        g_lr=args.g_lr,
-        d_lr=args.d_lr,
-        lambda_cls=args.lambda_cls,
-        lambda_rec=args.lambda_rec,
-        lambda_gp=args.lambda_gp,
-        n_critic=args.n_critic,
-        temperature=args.temperature,
-        device=args.device,
-        window_size=args.window_size,
-        window_stride=args.window_stride,
-        window_aggregation=args.window_aggregation
-    )
+    trainer = StarGANTrainer(args)
     
     print(f"Configuration:")
     print(f"  Generator model: {args.g_modelpath}")
@@ -927,20 +942,15 @@ def main():
     if args.num_iters is None:
         args.num_iters = len(dataloader)
     
+    # Store dataloader in args
+    args.dataloader = dataloader
+    
     print(f"Dataloader created successfully!")
     print(f"  Number of batches: {len(dataloader)}")
     print(f"  Training iterations: {args.num_iters}")
     
     # Start training
-    trainer.train(
-        dataloader=dataloader,
-        num_epochs=args.num_epochs,
-        num_iters=args.num_iters,
-        save_dir=args.model_save_dir,
-        log_dir=args.log_dir,
-        log_interval=args.log_step,
-        save_interval=args.model_save_step
-    )
+    trainer.train(args)
 
 
 if __name__ == '__main__':

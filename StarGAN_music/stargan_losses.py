@@ -6,11 +6,17 @@ Supports gradient flow from Discriminator to Generator
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional, List
 import json
 import numpy as np
 import re
+import sys
 
+sys.path.append("../Amadeus/Amadeus")
+from train_utils import dispersive_loss
+from train_utils import NLLLoss4CompoundToken
+
+AMADEUS_FIELDS = ["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"]
 
 class StraightThroughEstimator(torch.autograd.Function):
     """
@@ -120,8 +126,8 @@ def logits_to_discrete_tokens_differentiable(fake_logits, temperature=0.5, use_g
     
     # Convert each feature's logits to discrete tokens
     for feature_name in AMADEUS_FIELDS:
-        if feature_name in list(fake_logits[0].keys()):
-            logit = fake_logits[0][feature_name]  # [B, T, vocab_size]
+        if feature_name in list(fake_logits.keys()):
+            logit = fake_logits[feature_name]  # [B, T, vocab_size]
             
             if B is None:
                 B, T, _ = logit.shape
@@ -145,8 +151,6 @@ def logits_to_discrete_tokens_differentiable(fake_logits, temperature=0.5, use_g
     
     return hard_tokens
 
-
-AMADEUS_FIELDS = ["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"]
 
 # Import conversion functions from solver
 # We'll define them here to avoid circular imports
@@ -358,8 +362,8 @@ def logits_to_embeddings_via_projection(fake_logits, projection_layer, vocab_siz
     
     # Collect logits for each feature in order
     for feature_name in AMADEUS_FIELDS:
-        if feature_name in list(fake_logits[0].keys()):
-            logit = fake_logits[0][feature_name]  # [B, T, vocab_size]
+        if feature_name in list(fake_logits.keys()):
+            logit = fake_logits[feature_name]  # [B, T, vocab_size]
             if B is None:
                 B, T, _ = logit.shape
                 device = logit.device
@@ -403,8 +407,8 @@ def logits_to_embedded_input(fake_logits, embedding_layers, vocab_size_list, emb
     
     # Process each feature in order
     for feat_idx, feature_name in enumerate(AMADEUS_FIELDS):
-        if feature_name in list(fake_logits[0].keys()):
-            logit = fake_logits[0][feature_name]  # [B, T, vocab_size]
+        if feature_name in list(fake_logits.keys()):
+            logit = fake_logits[feature_name]  # [B, T, vocab_size]
             if B is None:
                 B, T, _ = logit.shape
                 device = logit.device
@@ -556,19 +560,57 @@ def compute_discriminator_loss(
     # Calculation fake loss
     d_loss_fake = torch.mean(fake_cls_output.real_fake_logits)
     
-    # ========== Gradient Penalty (simplified) ==========
-    # For soft embeddings, gradient penalty is less critical
-    d_loss_gp = torch.tensor(0.0, device=device)
+    # ========== Gradient Penalty (WGAN-GP) ==========
+    # Interpolate between real and fake embeddings for gradient penalty
+    # This stabilizes the discriminator and prevents gradient explosion
+    batch_size = real_embeddings.size(0)
+    seq_len = real_embeddings.size(1)
+    
+    # Generate random interpolation coefficients [B, 1, 1]
+    alpha = torch.rand(batch_size, 1, 1, device=device)
+    alpha = alpha.expand(batch_size, seq_len, -1)  # [B, T, 1] for broadcasting
+    
+    # Interpolate: hat_embeddings = alpha * real + (1 - alpha) * fake
+    hat_embeddings = (alpha * real_embeddings.detach() + (1 - alpha) * fake_embeddings.detach()).requires_grad_(True)
+    
+    # Forward pass through discriminator with interpolated embeddings
+    hat_cls_output = D(inputs_embeds=hat_embeddings)
+    hat_real_fake_logits = hat_cls_output.real_fake_logits  # [B*T,]
+    
+    # Compute gradient of discriminator output w.r.t. interpolated embeddings
+    # This measures the Lipschitz constant of the discriminator
+    gradients = torch.autograd.grad(
+        outputs=hat_real_fake_logits.sum(),
+        inputs=hat_embeddings,
+        create_graph=True,
+        retain_graph=True,
+    )[0]  # [B, T, hidden_size]
+    
+    # Compute L2 norm of gradients for each sample
+    gradients_norm = torch.sqrt(torch.sum(gradients**2, dim=[1, 2]) + 1e-8)  # [B]
+    
+    # Gradient penalty: (||grad|| - 1)^2
+    # Target is 1-Lipschitz constraint
+    d_loss_gp = torch.mean((gradients_norm - 1.0)**2)
     
     # ========== Total Discriminator loss ==========
     d_loss = d_loss_real + d_loss_fake + lambda_cls * d_loss_cls + lambda_gp * d_loss_gp
+    
+    # Compute gradient norm for monitoring
+    grad_norm_d = 0
+    for p in D.parameters():
+        if p.grad is not None:
+            grad_norm_d += (p.grad.data ** 2).sum().item()
+    grad_norm_d = grad_norm_d ** 0.5 if grad_norm_d > 0 else 0
     
     loss_dict = {
         'D/loss_real': d_loss_real.item(),
         'D/loss_fake': d_loss_fake.item(),
         'D/loss_cls': d_loss_cls.item(),
         'D/loss_gp': d_loss_gp.item() if isinstance(d_loss_gp, torch.Tensor) else d_loss_gp,
-        'D/loss_total': d_loss.item()
+        'D/loss_total': d_loss.item(),
+        'D/grad_norm': grad_norm_d,
+        'D/grad_penalty_norm': gradients_norm.mean().item() if 'gradients_norm' in locals() else 0
     }
     
     return d_loss, loss_dict
@@ -589,17 +631,24 @@ def compute_generator_loss(
     lambda_cls=1.0,
     lambda_rec=10.0,
     temperature=0.5,
-    device=None
+    device=None,
+    lambda_amadeus=1.0,
+    lambda_dispersive=0.5,
 ):
     """
     Compute Generator loss with gradient flow through Discriminator
     FULLY DIFFERENTIABLE design
+    
+    Now includes Amadeus model losses:
+    - Note Decoder Loss: Per-feature cross-entropy for generated tokens
+    - Music Latent Space Discriminability Enhancement Loss: Promotes diversity in latent space
     
     Args:
         G: Generator (AmadeusForStarGAN)
         D: Discriminator (LlamaForSequenceDoubleClassification)
         real_scores: [B, T, 8] Real scores (Amadeus discrete tokens)
         context: dict with 'input_ids' and 'attention_mask' for target domain
+        target_labels: [B, 108] Target domain labels
         original_context: dict with 'input_ids' and 'attention_mask' for original domain
         projection_layer: nn.Linear(total_vocab_size, hidden_size)
         vocab_size_list: List of vocab sizes for each feature
@@ -608,12 +657,14 @@ def compute_generator_loss(
         emb_size: Embedding size for each feature
         lambda_cls: Weight for domain classification loss
         lambda_rec: Weight for reconstruction loss
-        temperature: Temperature (unused in differentiable approach)
+        temperature: Temperature for Gumbel-Softmax sampling
+        device: Device for computation
+        lambda_amadeus: Weight for Amadeus Note Decoder Loss
+        lambda_dispersive: Weight for Discriminability Enhancement Loss (dispersive loss)
     
     Returns:
         g_loss: Total generator loss
         loss_dict: Dictionary of individual losses
-        fake_hard_tokens: [B, T, 8] Generated discrete tokens
     """
     real_scores = real_scores.long()
     B, T, _ = real_scores.shape
@@ -667,7 +718,7 @@ def compute_generator_loss(
     # Reconstruction loss: Cross-entropy per feature
     g_loss_rec = 0
     for feature_idx, feature_name in enumerate(AMADEUS_FIELDS):
-        reconst_logit = reconst_logits[0][feature_name]  # [B, T, vocab_size]
+        reconst_logit = reconst_logits[feature_name]  # [B, T, vocab_size]
         target_token = real_scores[:, :, feature_idx]  # [B, T]
         
         g_loss_rec += F.cross_entropy(
@@ -678,13 +729,56 @@ def compute_generator_loss(
     
     g_loss_rec = g_loss_rec / len(AMADEUS_FIELDS)
     
+    # ========== Amadeus Model Losses ==========
+    g_loss_amadeus = torch.tensor(0.0, device=device)
+    g_loss_dispersive = torch.tensor(0.0, device=device)
+    
+    amadeus_loss_fn = setup_amadeus_losses()
+    
+    if amadeus_loss_fn is not None:
+        # ========== Note Decoder Loss ==========
+        # Use fake_logits as predictions and real_scores as targets
+        # Create mask for valid tokens (non-padding)
+        valid_mask = torch.ones((B, T), dtype=torch.bool, device=device)
+        
+        g_loss_amadeus, amadeus_log_dict = amadeus_loss_fn(
+            logits_dict=fake_logits,  # Dict of {feature: [B, T, vocab_size]}
+            shifted_tgt=real_scores,  # [B, T, 8] target tokens
+            mask=valid_mask,  # [B, T] valid mask
+            valid=False  # No per-feature logging needed
+        )
+        
+        # ========== Music Latent Space Discriminability Enhancement Loss ==========
+        # Promote diversity in the latent space representation
+        if fake_input_dict is not None and 'hidden_vec' in fake_input_dict:
+            hidden_vec = fake_input_dict['hidden_vec']  # [B, T, hidden_dim]
+            # Average over sequence dimension to get batch representation
+            feat = hidden_vec.mean(dim=1)  # [B, hidden_dim]
+            
+            # Import dispersive_loss if not already available
+            g_loss_dispersive = dispersive_loss(feat, tau=0.5)  # scalar
+    
     # ========== Total Generator loss ==========
-    g_loss = g_loss_fake + lambda_cls * g_loss_cls + lambda_rec * g_loss_rec
+    # Weighted combination of all losses:
+    # 1. Adversarial loss (fool discriminator)
+    # 2. Domain classification loss (match target domain)
+    # 3. Cycle consistency reconstruction loss
+    # 4. Amadeus Note Decoder loss (generate realistic sequences)
+    # 5. Dispersive loss (promote latent space diversity)
+    g_loss = (
+        g_loss_fake 
+        + lambda_cls * g_loss_cls 
+        + lambda_rec * g_loss_rec
+        + lambda_amadeus * g_loss_amadeus
+        + lambda_dispersive * g_loss_dispersive
+    )
     
     loss_dict = {
         'G/loss_fake': g_loss_fake.item(),
         'G/loss_cls': g_loss_cls.item() if isinstance(g_loss_cls, torch.Tensor) else g_loss_cls,
         'G/loss_rec': g_loss_rec.item(),
+        'G/loss_amadeus': g_loss_amadeus.item(),
+        'G/loss_dispersive': g_loss_dispersive.item(),
         'G/loss_total': g_loss.item()
     }
     
@@ -742,3 +836,45 @@ def generate_target_domain(source_domains, num_samples=None):
     target_domains = source_domains[rand_idx]
     
     return target_domains
+
+
+def setup_amadeus_losses(encoding_scheme='nb', feature_list=None, focal_alpha=1.0, focal_gamma=2.0):
+    """
+    Setup Amadeus loss functions for StarGAN training
+    
+    Args:
+        encoding_scheme: 'cp' (Compound Token) or 'nb' (Narrow-Band)
+        feature_list: List of features (default: ["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"])
+        focal_alpha: Focal loss alpha parameter
+        focal_gamma: Focal loss gamma parameter
+    
+    Returns:
+        amadeus_loss_fn: Instantiated loss function
+    
+    Example:
+        from train_utils import NLLLoss4CompoundToken, DiffusionLoss4CompoundToken
+        
+        # For regular decoders
+        amadeus_loss = NLLLoss4CompoundToken(
+            feature_list=["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"],
+            focal_alpha=1.0,
+            focal_gamma=2.0
+        )
+        
+        # For Diffusion decoders
+        amadeus_loss = DiffusionLoss4CompoundToken(
+            feature_list=["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"],
+            focal_alpha=1.0,
+            focal_gamma=2.0
+        )
+    """
+    if feature_list is None:
+        feature_list = ["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"]
+    
+    amadeus_loss_fn = NLLLoss4CompoundToken(
+        feature_list=feature_list,
+        focal_alpha=focal_alpha,
+        focal_gamma=focal_gamma
+    )
+    
+    return amadeus_loss_fn
