@@ -284,6 +284,18 @@ class Evaluator:
       self.count_by_class[key] = torch.tensor(self.count_by_class[key]).cpu()
     torch.save({'loss_by_class':self.loss_by_class, 'count_by_class':self.count_by_class}, save_fn)
 
+  def _unpack_model_output(self, outputs):
+    if isinstance(outputs, tuple) and len(outputs) == 2:
+      return outputs[0], outputs[1]
+    return outputs, None
+
+  def _extract_mask_indices(self, aux, default_mask):
+    if isinstance(aux, dict):
+      return aux.get('mask_indices', default_mask)
+    if isinstance(aux, tuple) and len(aux) >= 1:
+      return aux[0]
+    return default_mask
+
   @torch.inference_mode()
   def get_perplexity(self,less_than=256):
     for data in tqdm(self.test_set.data_list, desc='Cal over dataset', position=0):
@@ -394,9 +406,12 @@ class Evaluator:
     x, y = x_seg[:, :self.input_len].to(self.device), y_seg[:, :self.input_len].to(self.device)
     mask_indices = torch.ones_like(y).bool().to(self.device).flatten(0,1)
     if self.config.use_diff is True:
-      logits,(mask_indices,_) = self.model(x, y)
+      outputs = self.model(x, y)
+      logits, aux = self._unpack_model_output(outputs)
+      mask_indices = self._extract_mask_indices(aux, mask_indices)
     else:
-      logits = self.model(x, y)
+      outputs = self.model(x, y)
+      logits, _ = self._unpack_model_output(outputs)
     y = y.flatten(0,1)
     if self.is_multiclass:
       for key in logits.keys():
@@ -415,9 +430,12 @@ class Evaluator:
     x, y = x.to(self.device), y.to(self.device)
     mask_indices = torch.ones_like(y).bool().to(self.device)
     if self.config.use_diff is True:
-      logits,(mask_indices,_) = self.model(x, y)
+      outputs = self.model(x, y)
+      logits, aux = self._unpack_model_output(outputs)
+      mask_indices = self._extract_mask_indices(aux, mask_indices)
     else:
-      logits = self.model(x, y)
+      outputs = self.model(x, y)
+      logits, _ = self._unpack_model_output(outputs)
     y = y[:, -1:].flatten(0,1).cpu()
     mask_indices = mask_indices.reshape(x.shape)[:,-1:].flatten(0,1).cpu()
     if self.is_multiclass:

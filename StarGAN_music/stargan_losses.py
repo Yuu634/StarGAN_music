@@ -13,8 +13,7 @@ import re
 import sys
 
 sys.path.append("../Amadeus/Amadeus")
-from train_utils import dispersive_loss
-from train_utils import NLLLoss4CompoundToken
+from train_utils import dispersive_loss, NLLLoss4CompoundToken
 
 AMADEUS_FIELDS = ["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"]
 
@@ -609,8 +608,8 @@ def compute_discriminator_loss(
         'D/loss_cls': d_loss_cls.item(),
         'D/loss_gp': d_loss_gp.item() if isinstance(d_loss_gp, torch.Tensor) else d_loss_gp,
         'D/loss_total': d_loss.item(),
-        'D/grad_norm': grad_norm_d,
-        'D/grad_penalty_norm': gradients_norm.mean().item() if 'gradients_norm' in locals() else 0
+        #'D/grad_norm': grad_norm_d,
+        #'D/grad_penalty_norm': gradients_norm.mean().item() if 'gradients_norm' in locals() else 0
     }
     
     return d_loss, loss_dict

@@ -123,6 +123,7 @@ def prepare_model_and_dataset_from_config(config: DictConfig, vocab_path:str):
                           heads=nn_params.main_decoder.num_head,
                           depth=nn_params.main_decoder.num_layer,
                           dropout=nn_params.model_dropout,
+                          is_regressive=True
                           )
     
     return AmadeusModel, [], vocab
@@ -181,6 +182,42 @@ def generate_with_text_prompt(config, vocab, model, device, prompt, save_dir,
     output_file = save_dir / f"generated.mid"
     decoder(generated_sample, output_path=str(output_file))
     print(f"Generated file saved at: {output_file}")
+
+
+def generate_with_textANDscore_prompt(config, vocab, model, device, prompt, input_note, 
+                                      save_dir, first_pred_feature, sampling_method, threshold,
+                                      temperature, generation_length):
+    encoding_scheme = config.nn_params.encoding_scheme
+    tokenizer = T5Tokenizer.from_pretrained(config.text_encoder_model)
+    encoder = T5EncoderModel.from_pretrained(config.text_encoder_model).to(device)
+    print(f"Using T5EncoderModel for text prompt:\n{prompt}")
+    context = tokenizer(prompt, return_tensors='pt',
+                        padding='max_length', truncation=True, max_length=128).to(device)
+    context = encoder(**context).last_hidden_state
+
+    in_beat_resolution_dict = {'Pop1k7': 4, 'Pop909': 4, 'SOD': 12, 'LakhClean': 4}
+    in_beat_resolution = in_beat_resolution_dict.get(config.dataset, 4)
+
+    midi_decoder_dict = {'remi': 'MidiDecoder4REMI',
+                         'cp': 'MidiDecoder4CP',
+                         'nb': 'MidiDecoder4NB'}
+    decoder_name = midi_decoder_dict[encoding_scheme]
+    decoder = getattr(decoding_utils, decoder_name)(
+        vocab=vocab, in_beat_resolution=in_beat_resolution, dataset_name=config.dataset
+    )
+
+    generated_sample = model.generate(
+        0, generation_length, condition=None, num_target_measures=None,
+        sampling_method=sampling_method, threshold=threshold,
+        temperature=temperature, context=context, input_note=input_note
+    )
+    if encoding_scheme == 'nb':
+        generated_sample = reverse_shift_and_pad_for_tensor(generated_sample, first_pred_feature)
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    output_file = save_dir / f"{prompt}.mid"
+    decoder(generated_sample, output_path=str(output_file))
 
 
 def main():

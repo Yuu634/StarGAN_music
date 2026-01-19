@@ -80,21 +80,18 @@ class AmadeusModelWrapper(nn.Module):
     return next(self.parameters()).device
 
   def forward(self, input_seq:torch.Tensor, target:torch.Tensor, context=None):
-    if self.is_regressive:
-      return self.forward_stepwise(input_seq, target, context=context)
-    else:
-      embedding = self.input_embedder(input_seq) + self.pos_enc(input_seq)
-      embedding = self.emb_dropout(embedding)
-      hidden_vec,layer_inter = self.main_decoder(embedding,train=True, context=context)  # B x T x d_model
-      hidden_vec = self.main_norm(hidden_vec)
-      input_dict = {'hidden_vec':hidden_vec, 'input_seq': input_seq, 'target': target, 'bos_token_hidden': self.bos_token_hidden}
-      logits = self.sub_decoder(input_dict)
-      # 选择总数中离三分之一最近的层
-      num_layers = len(layer_inter.layer_hiddens)
-      idx = round(num_layers / 3)
-      idx = min(max(idx, 0), num_layers - 1)
-      input_dict['hidden_vec'] = layer_inter.layer_hiddens[idx]
-      return logits[0], input_dict
+    embedding = self.input_embedder(input_seq) + self.pos_enc(input_seq)
+    embedding = self.emb_dropout(embedding)
+    hidden_vec,layer_inter = self.main_decoder(embedding,train=True, context=context)  # B x T x d_model
+    hidden_vec = self.main_norm(hidden_vec)
+    input_dict = {'hidden_vec':hidden_vec, 'input_seq': input_seq, 'target': target, 'bos_token_hidden': self.bos_token_hidden}
+    logits = self.sub_decoder(input_dict)
+    # 选择总数中离三分之一最近的层
+    num_layers = len(layer_inter.layer_hiddens)
+    idx = round(num_layers / 3)
+    idx = min(max(idx, 0), num_layers - 1)
+    input_dict['hidden_vec'] = layer_inter.layer_hiddens[idx]
+    return logits[0], input_dict
       
 
   def _init_generated_seq(self, batch_size:int, device:torch.device):
@@ -121,80 +118,6 @@ class AmadeusModelWrapper(nn.Module):
         stacked[k] = torch.cat([v, v.new_zeros(v.shape[0], pad, v.shape[2])], dim=1)
     return stacked
 
-  def forward_stepwise(self, input_seq:torch.Tensor, target:torch.Tensor, context=None):
-    """
-    Step-wise conditioned forward for accompaniment - Memory-optimized version:
-    - At step n, build sequence = [generated tokens (<= n-1), input score token at n]
-    - main_decoder: no_grad for steps < T-1, compute gradients only for final step
-    - sub_decoder: compute gradients for all steps
-    - Sample argmax token from logits to extend generated sequence.
-    """
-    B, T = input_seq.shape[0], input_seq.shape[1]
-    device = input_seq.device
-
-    generated_seq = self._init_generated_seq(B, device)
-    logits_steps = []
-    aux_steps = []
-
-    for t in range(1, T):
-      score_token = input_seq[:, t:t+1]  # B x 1 x feat
-      concat_seq = torch.cat([generated_seq, score_token], dim=1)  # B x L x feat
-
-      # ✅ Memory optimization: Use no_grad for main_decoder in intermediate steps
-      if t < T - 1:  # All steps except the last one
-        with torch.no_grad():
-          embedding = self.input_embedder(concat_seq) + self.pos_enc(concat_seq)
-          embedding = self.emb_dropout(embedding)
-          hidden_vec, layer_inter = self.main_decoder(embedding, train=True, context=context)
-          hidden_vec = self.main_norm(hidden_vec)
-          # Detach to prevent gradient computation
-          hidden_vec = hidden_vec.detach()
-      else:  # Last step: compute gradients for main_decoder
-        embedding = self.input_embedder(concat_seq) + self.pos_enc(concat_seq)
-        embedding = self.emb_dropout(embedding)
-        hidden_vec, layer_inter = self.main_decoder(embedding, train=True, context=context)
-        hidden_vec = self.main_norm(hidden_vec)
-
-      # use last hidden only for current prediction
-      hidden_last = hidden_vec[:, -1:, :]
-      target_slice = target[:, t:t+1] if target is not None else None
-      input_dict = {
-        'hidden_vec': hidden_last,
-        'input_seq': concat_seq,
-        'target': target_slice,
-        'bos_token_hidden': self.bos_token_hidden
-      }
-
-      # ✅ sub_decoder: Always compute gradients
-      sub_out = self.sub_decoder(input_dict)
-      aux_outputs = None
-      if isinstance(sub_out, tuple) and len(sub_out) == 2:
-        logits, aux_outputs = sub_out
-      else:
-        logits = sub_out
-      aux_steps.append(aux_outputs)
-
-      # logits is dict(feature -> B x 1 x vocab) for DiffusionDecoder
-      logits_steps.append(logits)
-
-      # argmax sample to feed next step (no gradients needed)
-      with torch.no_grad():
-        sampled_tokens = []
-        for feature in self.prediction_order:
-          feat_logit = logits[feature]  # B x 1 x V
-          sampled = torch.argmax(feat_logit, dim=-1)  # B x 1
-          sampled_tokens.append(sampled)
-        sampled_token = torch.stack(sampled_tokens, dim=-1)  # B x 1 x num_features
-      
-      generated_seq = torch.cat([generated_seq, sampled_token], dim=1)
-      
-      # ✅ Explicit memory cleanup
-      del embedding, hidden_vec, input_dict
-      torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-    stacked_logits = self._stack_logits(logits_steps, T)
-    return stacked_logits, {'generated_seq': generated_seq, 'aux_outputs': aux_steps}
- 
 
 class AmadeusModelAutoregressiveWrapper(nn.Module):
   def __init__(self, net:AmadeusModelWrapper):
@@ -343,7 +266,7 @@ class AmadeusModelAutoregressiveWrapper(nn.Module):
 
     Returns:
     - total_out: The generated sequence of tokens as a tensor.
-    '''  
+    '''
     # Prepare the starting sequence for inference
     total_out = self._prepare_inference(self.net.start_token, manual_seed, condition, num_target_measures)
 
@@ -390,37 +313,53 @@ class AmadeusModelAutoregressiveWrapper(nn.Module):
       # Stop if the end token is reached
       if sampled_token.tolist() == self.net.end_token[0]:
         break
-    # append hidden_vec to pkl
+    """input_note = input_note.long()
+        
+    if input_note.dim() == 2:
+      input_note = input_note.unsqueeze(0)
+      
+    # Prepare the starting sequence for inference
+    total_out = self._prepare_inference(self.net.start_token, manual_seed, condition, num_target_measures)
 
-    # save_path = 'hidden/diffnoaug_hidden_vec.pt'
-    # save_time_path = 'hidden/diff_noaug_token_time.json'
-    # if os.path.exists(save_path):
-    #   # Load existing list and append
-    #   hidden_vec_all = torch.load(save_path, map_location="cpu")
-    #   hidden_vec_all.extend(hidden_vec_list)
-    #   torch.save(hidden_vec_all, save_path)
-    # else:
-    #   torch.save(hidden_vec_list, save_path)
-    
-    # if os.path.exists(save_time_path):
-    #   # Load existing list and append
-    #   token_time_all = json.load(open(save_time_path, 'r'))
-    #   token_time_all = token_time_all['token_time_list']
-    #   token_time_all.extend(token_time_list)
-    #   average_time = sum(token_time_all) / len(token_time_all)
-    #   data = {
-    #     'average_time': average_time,
-    #     'token_time_list': token_time_all
-    #   }
-    #   json.dump(data, open(save_time_path, 'w'), indent=4)
-    # else:
-    #   average_time = sum(token_time_list) / len(token_time_list)
-    #   data = {
-    #     'average_time': average_time,
-    #     'token_time_list': token_time_list
-    #   }
-    #   json.dump(data, open(save_time_path, 'w'), indent=4)
+    # If a condition is provided, run one initial step
+    if condition is not None:
+      _, _, cache = self._run_one_step(input_note[:, 0], cache=LayerIntermediates(), sampling_method=sampling_method, threshold=threshold, temperature=temperature, context=context)
+    else:
+      cache = LayerIntermediates()
 
+    # Continue generating tokens until the maximum sequence length is reached
+    pbar = tqdm(total=max_seq_len, desc="Generating tokens", unit="token")
+    bos_hidden_vec = None
+    hidden_vec_list = []
+    token_time_list = []
+    generate_step = 0
+    while total_out.shape[1] < max_seq_len:
+      pbar.update(1)
+      generate_step += 1
+      if generate_step - self.net.input_length < 0:
+        input_tensor = input_note[:, :generate_step]
+      else:
+        input_tensor = input_note[:, generate_step-self.net.input_length:generate_step]
+      # Generate the next token and update the cache
+      time_start = time.time()
+      _, sampled_token, cache, hidden_vec = self._run_one_step(input_tensor, cache=cache, sampling_method=sampling_method, threshold=threshold, temperature=temperature,bos_hidden_vec=bos_hidden_vec, context=context)
+      time_end = time.time()
+      token_time_list.append(time_end - time_start)
+      if bos_hidden_vec is None:
+        bos_hidden_vec = hidden_vec
+      hidden_vec_list.append(hidden_vec)
+      # Update attention cache to handle autoregressive generation
+      for inter in cache.attn_intermediates:
+        inter.cached_kv = [t[..., -(self.net.input_length - 1):, :] for t in inter.cached_kv]
+
+      # Update the generated output with the new token
+      total_out, sampled_token = self._update_total_out(total_out, sampled_token)
+
+      # Stop if the end token is reached
+      if sampled_token.tolist() == self.net.end_token[0]:
+        break
+    """
+      
     return total_out
   
   def generate_batch(self, manual_seed, max_seq_len, condition=None, num_target_measures=4, sampling_method=None, threshold=None, temperature=1, batch_size=1, input_note=None):

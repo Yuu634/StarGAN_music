@@ -30,103 +30,12 @@ from Amadeus.evaluation_utils import wandb_style_config_to_omega_config
 from data_representation import vocab_utils
 from transformers import LlamaForSequenceClassification, LlamaConfig, T5Tokenizer, T5EncoderModel
 from src.llama_recipes.real_finetuning_player_classification import LlamaForSequenceDoubleClassification
+from scheduler import AdaptiveHyperparameterScheduler
+from utils import split_sequence_with_sliding_window, aggregate_window_outputs
 
 # Import loss functions
 from stargan_losses import compute_discriminator_loss, compute_generator_loss
 from data_loader import get_loader
-
-
-def split_sequence_with_sliding_window(sequence, window_size=3072, stride=None):
-    """
-    Split a sequence longer than window_size into overlapping windows.
-    
-    Args:
-        sequence: Tensor of shape [T, ...] where T is sequence length
-        window_size: Maximum length per window (default: Amadeus max input length = 3072)
-        stride: Step size for sliding window. If None, stride = window_size (no overlap)
-    
-    Returns:
-        List of sequence windows, each with length <= window_size
-        Also returns start positions for each window
-    
-    Example:
-        >>> seq = torch.randn(5000, 8)  # Longer than window_size
-        >>> windows, positions = split_sequence_with_sliding_window(seq, window_size=3072, stride=1536)
-        >>> # windows[0].shape = [3072, 8]
-        >>> # windows[1].shape = [3072, 8]
-        >>> # windows[2].shape = [1928, 8]  (remaining)
-    """
-    seq_len = sequence.shape[0]
-    
-    # If sequence is shorter than window size, return as is
-    if seq_len <= window_size:
-        return [sequence], [0]
-    
-    # Default stride = window_size (no overlap)
-    if stride is None:
-        stride = window_size
-    
-    windows = []
-    positions = []
-    
-    # Create sliding windows
-    current_pos = 0
-    while current_pos < seq_len:
-        end_pos = min(current_pos + window_size, seq_len)
-        window = sequence[current_pos:end_pos]
-        windows.append(window)
-        positions.append(current_pos)
-        
-        # Break if we've reached the end
-        if end_pos >= seq_len:
-            break
-        
-        current_pos += stride
-    
-    return windows, positions
-
-
-def aggregate_window_outputs(window_outputs, aggregation_method='mean'):
-    """
-    Aggregate predictions from multiple sliding windows.
-    
-    Args:
-        window_outputs: List of dicts, each containing:
-            - 'd_real': Real/fake discrimination score [B, 1]
-            - 'd_fake': Real/fake discrimination score [B, 1]
-            - 'd_cls': Domain classification logits [B, num_domains]
-            - Other optional keys
-        aggregation_method: 'mean' (average), 'max' (maximum), or 'first' (first window only)
-    
-    Returns:
-        Aggregated output dict with same structure as input
-    """
-    if len(window_outputs) == 1:
-        return window_outputs[0]
-    
-    # Stack outputs from all windows
-    aggregated = {}
-    
-    for key in window_outputs[0].keys():
-        values = [out[key] for out in window_outputs]
-        
-        # Stack along a new dimension
-        stacked = torch.stack(values, dim=0)  # [num_windows, ...]
-        
-        if aggregation_method == 'mean':
-            aggregated[key] = stacked.mean(dim=0)
-        elif aggregation_method == 'max':
-            # For classification logits, take max; for scores, take mean
-            if 'cls' in key:
-                aggregated[key] = stacked.max(dim=0)[0]
-            else:
-                aggregated[key] = stacked.mean(dim=0)
-        elif aggregation_method == 'first':
-            aggregated[key] = window_outputs[0][key]
-        else:
-            raise ValueError(f"Unknown aggregation method: {aggregation_method}")
-    
-    return aggregated
 
 
 class StarGANTrainer:
@@ -277,6 +186,24 @@ class StarGANTrainer:
         
         self.g_optimizer = optim.Adam(g_params, lr=self.g_lr, betas=(0.5, 0.999))
         self.d_optimizer = optim.Adam(d_params, lr=self.d_lr, betas=(0.5, 0.999))
+        
+        # Initialize adaptive hyperparameter scheduler
+        print("Initializing adaptive hyperparameter scheduler...")
+        self.hp_scheduler = AdaptiveHyperparameterScheduler(
+            initial_g_lr=self.g_lr,
+            initial_d_lr=self.d_lr,
+            initial_lambda_gp=self.lambda_gp,
+            initial_lambda_cls=self.lambda_cls,
+            initial_lambda_rec=self.lambda_rec,
+            ideal_d_loss=0,  
+            ideal_balance_ratio=1.5,   # Target D_loss / G_loss
+            ema_decay=0.95,
+            stability_threshold=0.5,
+            warmup_steps=0,
+        )
+        print(f"  Ideal D_loss: {self.hp_scheduler.ideal_d_loss:.4f}")
+        print(f"  Ideal balance ratio (D_loss/G_loss): {self.hp_scheduler.ideal_balance_ratio:.4f}")
+        print(f"  Warmup steps: {self.hp_scheduler.warmup_steps}")
         
         print("StarGAN Trainer initialized successfully!")
         print(f"Generator parameters: {sum(p.numel() for p in self.G.parameters()):,}")
@@ -675,16 +602,43 @@ class StarGANTrainer:
                         
                         # Aggregate results from all windows
                         if len(windows) > 1:
-                            #print(f"  Aggregating results from {len(windows)} windows using '{self.window_aggregation}' method")
-                            # Simple aggregation: average loss across windows
-                            d_loss = sum(out[0] for out in window_outputs) / len(window_outputs)
-                            g_loss = sum(out[1] for out in window_outputs) / len(window_outputs)
                             # Merge logs
                             logs = {}
                             for key in window_outputs[0][2].keys():
                                 logs[key] = sum(out[2][key] for out in window_outputs) / len(window_outputs)
                         else:
                             d_loss, g_loss, logs = window_outputs[0]
+                        
+                        # Extract adversarial losses only (not including classification and reconstruction losses)
+                        # D adversarial loss = loss_real + loss_fake
+                        d_adversarial_loss = logs.get('D/loss_real', 0.0) + logs.get('D/loss_fake', 0.0)
+                        # G adversarial loss = loss_fake (generator tries to fool discriminator)
+                        g_adversarial_loss = logs.get('G/loss_fake', 0.0)
+                        
+                        # Update adaptive hyperparameter scheduler with adversarial losses only
+                        d_grad_norm = logs.get('D/grad_norm', None)
+                        g_grad_norm = logs.get('G/grad_norm', None)
+                        
+                        metrics = self.hp_scheduler.update(
+                            d_loss=d_adversarial_loss,
+                            g_loss=g_adversarial_loss,
+                            d_grad_norm=d_grad_norm,
+                            g_grad_norm=g_grad_norm,
+                        )
+                        
+                        # Update optimizer learning rates based on scheduler
+                        for param_group in self.g_optimizer.param_groups:
+                            param_group['lr'] = self.hp_scheduler.current_g_lr
+                        for param_group in self.d_optimizer.param_groups:
+                            param_group['lr'] = self.hp_scheduler.current_d_lr
+                        
+                        # Update lambda values for loss computation
+                        self.lambda_cls = self.hp_scheduler.current_lambda_cls
+                        self.lambda_rec = self.hp_scheduler.current_lambda_rec
+                        self.lambda_gp = self.hp_scheduler.current_lambda_gp
+                        
+                        # Store metrics for logging
+                        self._last_metrics = metrics
                         
                         train_success = True
                         self.oom_count = 0  # Reset OOM counter on success
@@ -721,28 +675,48 @@ class StarGANTrainer:
                 progress_percent = ((i + 1) / num_iters) * 100
                 progress_str = f"Progress: {i+1}/{num_iters} ({progress_percent:.1f}%) | Success: {success_count} | Failure: {failure_count}"
                 print(progress_str, end='\r')
-                #if train_success:
+                
                 if (success_count % log_interval == 0) and (success_count > 0):
                     # Prepare log data
                     log_data = {
                         'epoch': epoch + 1,
                         'iteration': i + 1,
+                        'step': self.hp_scheduler.step_count,
                         'lambda_gp': self.lambda_gp,  # Add current GP weight
+                        'lambda_cls': self.lambda_cls,
+                        'lambda_rec': self.lambda_rec,
+                        'g_lr': self.hp_scheduler.current_g_lr,
+                        'd_lr': self.hp_scheduler.current_d_lr,
                         **logs
                     }
                     
                     if self.oom_count > 0:
                         log_data['oom_events'] = self.oom_count
                     
-                    # Write to text log file with gradient monitoring
-                    log_str = f"Epoch [{log_data['epoch']}/{num_epochs}] | Iteration [{log_data['iteration']}/{num_iters}] | Success: {success_count} | Failure: {failure_count} | "
-                    log_str += ", ".join([f"{k}: {v:10.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in logs.items()])
-                    if self.oom_count > 0:
-                        log_str += f", OOM Events: {self.oom_count}"
+                    # Add monitoring metrics if available (after first update)
+                    if hasattr(self, '_last_metrics'):
+                        log_data['balance_ratio'] = self._last_metrics.balance_ratio
+                        log_data['d_ideal_gap'] = self._last_metrics.d_ideal_gap
+                        log_data['stability_score'] = self._last_metrics.stability_score
+                        log_data['d_loss_ema'] = self._last_metrics.d_loss_ema
+                        log_data['g_loss_ema'] = self._last_metrics.g_loss_ema
                     
-                    # Add gradient monitoring info
-                    if 'D/grad_norm' in logs and 'D/grad_penalty_norm' in logs:
-                        log_str += f" | GradNorm_D: {logs['D/grad_norm']:10.4f} | GradPenalty_avg: {logs['D/grad_penalty_norm']:10.4f}"
+                    # Write to text log file with gradient monitoring
+                    log_str = f"Epoch [{log_data['epoch']}/{num_epochs}] | Iteration [{log_data['iteration']:6}/{num_iters}] | Success: {success_count:6} | Failure: {failure_count:6} | "
+                    
+                    # Format numeric values
+                    numeric_logs = {k: v for k, v in logs.items() if isinstance(v, float)}
+                    log_str += ", ".join([f"{k}: {v:10.4f}" for k, v in numeric_logs.items()])
+                    
+                    # Add scheduler info
+                    log_str += f" | G_LR: {self.hp_scheduler.current_g_lr:.2e} | D_LR: {self.hp_scheduler.current_d_lr:.2e}"
+                    
+                    # Add stability metrics
+                    if hasattr(self, '_last_metrics'):
+                        log_str += f" | Balance: {self._last_metrics.balance_ratio:.4f} | Stability: {self._last_metrics.stability_score:.4f}"
+                    
+                    if self.oom_count > 0:
+                        log_str += f" | OOM Events: {self.oom_count}"
                     
                     with open(log_file, 'a') as f:
                         f.write(log_str + '\n')
@@ -790,10 +764,12 @@ class StarGANTrainer:
             'generator_state_dict': self.G.state_dict(),
             'discriminator_state_dict': self.D.state_dict(),
             'g_optimizer_state_dict': self.g_optimizer.state_dict(),
-            'd_optimizer_state_dict': self.d_optimizer.state_dict()
+            'd_optimizer_state_dict': self.d_optimizer.state_dict(),
+            'hp_scheduler_state_dict': self.hp_scheduler.get_state_dict(),  # Save scheduler state
         }
         
         torch.save(checkpoint, checkpoint_path)
+        print(f"Checkpoint saved to {checkpoint_path}")
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint"""
@@ -803,6 +779,11 @@ class StarGANTrainer:
         self.D.load_state_dict(checkpoint['discriminator_state_dict'])
         self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state_dict'])
         self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state_dict'])
+        
+        # Load scheduler state if available
+        if 'hp_scheduler_state_dict' in checkpoint:
+            self.hp_scheduler.load_state_dict(checkpoint['hp_scheduler_state_dict'])
+            print(f"Loaded scheduler state from checkpoint (step: {self.hp_scheduler.step_count})")
         
         epoch = checkpoint['epoch']
         step = checkpoint['step']
@@ -814,13 +795,13 @@ def main():
     parser = argparse.ArgumentParser(description='StarGAN Training with Real Models')
     
     """<Experimental parameters>"""
-    now_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+    #now_time = datetime.now().strftime('%Y%m%d_%H%M%S')
     #model_name = f'MidiCaps-{now_time}'
-    model_name = 'MidiCaps-Genre-D_interval=10'
+    model_name = 'MidiCaps-Genre-ParamsTuned-G_interval=10'
     parser.add_argument('--Is_AmadeusRegressive', type=bool, default=False,
                         help='Whether to use Amadeus in regressive mode (True/False)')
-    parser.add_argument('--g_interval', type=int, default=1, help='G update interval iterations')
-    parser.add_argument('--d_interval', type=int, default=10, help='D update interval iterations')
+    parser.add_argument('--g_interval', type=int, default=10, help='G update interval iterations')
+    parser.add_argument('--d_interval', type=int, default=1, help='D update interval iterations')
     
     
     # Model paths (from main.py)
@@ -838,8 +819,8 @@ def main():
     parser.add_argument('--num_epochs', type=int, default=1, help='number of total epochs for training D')
     parser.add_argument('--num_iters', type=int, default=None, help='number of total iterations for training D')
     parser.add_argument('--num_iters_decay', type=int, default=100000, help='number of iterations for decaying lr')
-    parser.add_argument('--g_lr', type=float, default=0.00005, help='learning rate for G')
-    parser.add_argument('--d_lr', type=float, default=0.00005, help='learning rate for D')
+    parser.add_argument('--g_lr', type=float, default=5e-5, help='learning rate for G')
+    parser.add_argument('--d_lr', type=float, default=5e-5, help='learning rate for D')
     parser.add_argument('--lambda_cls', type=float, default=1, help='weight for domain classification loss')
     parser.add_argument('--lambda_rec', type=float, default=2, help='weight for reconstruction loss')
     parser.add_argument('--lambda_gp', type=float, default=10, help='weight for gradient penalty')
@@ -849,9 +830,9 @@ def main():
     parser.add_argument('--resume_iters', type=int, default=None, help='resume training from this step')
     
     # Sliding window parameters for handling sequences longer than Amadeus max input length
-    parser.add_argument('--window_size', type=int, default=1024,
+    parser.add_argument('--window_size', type=int, default=512,
                        help='sliding window size (default: 3072, Amadeus max input length)')
-    parser.add_argument('--window_stride', type=int, default=1024,
+    parser.add_argument('--window_stride', type=int, default=512,
                        help='sliding window stride (default: None = window_size, no overlap)')
     parser.add_argument('--window_aggregation', type=str, default='mean',
                        choices=['mean', 'max', 'first'],
@@ -871,10 +852,10 @@ def main():
     parser.add_argument('--device', type=str, default='cuda', help='Training device')
     
     # Step sizes (from main.py)
-    parser.add_argument('--log_step', type=int, default=100, help='Log step interval')
-    parser.add_argument('--sample_step', type=int, default=1000, help='Sample step interval')
+    parser.add_argument('--log_step', type=int, default=10, help='Log step interval')
+    #parser.add_argument('--sample_step', type=int, default=1000, help='Sample step interval')
     parser.add_argument('--model_save_step', type=int, default=10000, help='Model save step interval')
-    parser.add_argument('--lr_update_step', type=int, default=1000, help='Learning rate update step')
+    #parser.add_argument('--lr_update_step', type=int, default=1000, help='Learning rate update step')
     
     # Generator configuration (from main.py)
     parser.add_argument('--generate_length', type=int, default=100, help='length of the generated sequence')
