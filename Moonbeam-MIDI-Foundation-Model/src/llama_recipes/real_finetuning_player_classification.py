@@ -200,6 +200,7 @@ class LlamaForSequenceDoubleClassification(
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        Is_real: Optional[bool] = None,
     ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -251,16 +252,19 @@ class LlamaForSequenceDoubleClassification(
 
         real_fake_loss = 0
         classification_loss = 0
+        # Real/fake classification loss
+        if Is_real is not None:
+            loss_fct = BCEWithLogitsLoss()
+            real_fake_labels = torch.ones_like(pooled_real_fake_logits) if Is_real else torch.zeros_like(pooled_real_fake_logits)
+            if self.num_labels == 1:
+                real_fake_loss = loss_fct(pooled_real_fake_logits.squeeze(), real_fake_labels.squeeze())
+            else:
+                real_fake_loss = loss_fct(pooled_real_fake_logits, real_fake_labels)
+        
+        # Classification loss
         if labels is not None:
             labels = labels.to(logits.device)
-            # Real/fake classification loss
-            loss_fct = MSELoss()
-            if self.num_labels == 1:
-                real_fake_loss = loss_fct(pooled_real_fake_logits.squeeze(), labels.squeeze())
-            else:
-                real_fake_loss = loss_fct(pooled_real_fake_logits, labels)
-            
-            # Classification loss
+        
             if self.config.problem_type is None:
                 if self.num_labels == 1:
                     self.config.problem_type = "regression"

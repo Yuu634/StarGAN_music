@@ -47,6 +47,11 @@ class MusicDataset(data.Dataset):
                         label.append(True)
                     else:
                         label.append(False)
+                
+                # 全ドメインに該当しない⇒学習データとして利用不可
+                if label.count(True) == 0:
+                    continue
+                
                 label = torch.tensor(label)
                         
                 if (i+1) < 2000:

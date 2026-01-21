@@ -72,7 +72,7 @@ class StarGANTrainer:
         self.Is_AmadeusRegressive = args.Is_AmadeusRegressive
         
         # Multi-GPU device setup
-        if self.use_multi_gpu and torch.cuda.device_count() >= 3:
+        if self.use_multi_gpu and torch.cuda.device_count() >= 2:
             self.device_g = 'cuda:0'  # Generator GPU 0
             self.device_d = 'cuda:1'  # Discriminator GPU 1
             self.device_t5 = 'cuda:0'  # T5 encoder on GPU 0
@@ -797,10 +797,10 @@ def main():
     """<Experimental parameters>"""
     #now_time = datetime.now().strftime('%Y%m%d_%H%M%S')
     #model_name = f'MidiCaps-{now_time}'
-    model_name = 'MidiCaps-Genre-ParamsTuned-G_interval=10'
+    model_name = 'MidiCaps-GenreSmall-ParamsTuned-G_interval=50_logits'
     parser.add_argument('--Is_AmadeusRegressive', type=bool, default=False,
                         help='Whether to use Amadeus in regressive mode (True/False)')
-    parser.add_argument('--g_interval', type=int, default=10, help='G update interval iterations')
+    parser.add_argument('--g_interval', type=int, default=50, help='G update interval iterations')
     parser.add_argument('--d_interval', type=int, default=1, help='D update interval iterations')
     
     
@@ -864,8 +864,9 @@ def main():
     
     # Domain labels (from main.py)
     parser.add_argument('--selected_attrs', '--list', nargs='+', help='selected attributes for Music dataset',
-                        default=['chillout', 'electropop', 'latin', 'popfolk', 'classical', 'metal', 'pop', 'poprock', 'drumnbass', 'celtic', 'newage', 'instrumentalpop', 'jazzfusion', 'alternative', 'lounge', 'funk', 'orchestral', 'blues', 'indie', 'house', 'instrumentalrock', 'world', 'trance', 'ambient', '80s', 'dance', 'experimental', 'rock', 'symphonic', 'reggae', 'punkrock', 'jazz', 'easylistening', 'country', 'soundtrack', 'folk', 'electronic', '90s', 'techno', 'hiphop', 'swing', 'synthpop'])
-                        #default=['funk', 'celtic', 'instrumentalpop', 'ambient', 'reggae', 'popfolk', 'dance', 'rock', 'classical', 'instrumentalrock', 'folk', 'poprock', 'indie', 'hiphop', 'blues', 'experimental', 'punkrock', 'jazz', 'electronic', 'techno', 'jazzfusion', 'pop', 'alternative', 'electropop', 'soundtrack', 'trance', 'house', 'metal', 'world', 'symphonic', 'lounge', 'easylistening', 'orchestral', 'country', 'newage', 'latin', 'drumnbass', '80s', '90s', 'swing', 'chillout', 'synthpop', 'movie', 'christmas', 'heavy', 'corporate', 'action', 'romantic', 'energetic', 'background', 'children', 'calm', 'adventure', 'motivational', 'summer', 'funny', 'dramatic', 'cool', 'positive', 'emotional', 'holiday', 'deep', 'love', 'dark', 'dream', 'advertising', 'happy', 'soundscape', 'film', 'melodic', 'drama', 'uplifting', 'epic', 'ballad', 'sad', 'relaxing', 'party', 'trailer', 'inspiring', 'soft', 'slow', 'game', 'retro', 'fun', 'meditative', 'sport', 'space', 'commercial', 'documentary', 'upbeat', 'Eb major', 'B major', 'Bb major', 'F# minor', 'F# major', 'G# minor', 'A major', 'B minor', 'E minor', 'D minor', 'F minor', 'G minor', 'F major', 'Eb minor', 'C major', 'A minor', 'G major', 'D major', 'C# major', 'Bb minor', 'Ab major', 'C# minor', 'C minor', 'E major'])
+                        default=["classical", "rock"]
+                        #default=['chillout', 'electropop', 'latin', 'popfolk', 'classical', 'metal', 'pop', 'poprock', 'drumnbass', 'celtic', 'newage', 'instrumentalpop', 'jazzfusion', 'alternative', 'lounge', 'funk', 'orchestral', 'blues', 'indie', 'house', 'instrumentalrock', 'world', 'trance', 'ambient', '80s', 'dance', 'experimental', 'rock', 'symphonic', 'reggae', 'punkrock', 'jazz', 'easylistening', 'country', 'soundtrack', 'folk', 'electronic', '90s', 'techno', 'hiphop', 'swing', 'synthpop']
+    )
     
     args = parser.parse_args()
     

@@ -531,7 +531,7 @@ def compute_discriminator_loss(
     real_embeddings = tokens_to_embeddings_via_projection(real_scores, projection_layer, vocab_size_list, hidden_size)  # [B, T, hidden_size]
     
     # Use embeddings directly as Discriminator input
-    real_cls_output = D(inputs_embeds=real_embeddings)
+    real_cls_output = D(inputs_embeds=real_embeddings, Is_real=True)
     
     # Calculation real loss
     d_loss_real = - torch.mean(real_cls_output.real_fake_logits)
@@ -554,7 +554,7 @@ def compute_discriminator_loss(
     fake_embeddings = logits_to_embeddings_via_projection(fake_logits, projection_layer, vocab_size_list, hidden_size)  # [B, T, hidden_size]
     
     # Use embeddings directly as Discriminator input
-    fake_cls_output = D(inputs_embeds=fake_embeddings)
+    fake_cls_output = D(inputs_embeds=fake_embeddings, Is_real=False)
     
     # Calculation fake loss
     d_loss_fake = torch.mean(fake_cls_output.real_fake_logits)
@@ -573,13 +573,13 @@ def compute_discriminator_loss(
     hat_embeddings = (alpha * real_embeddings.detach() + (1 - alpha) * fake_embeddings.detach()).requires_grad_(True)
     
     # Forward pass through discriminator with interpolated embeddings
-    hat_cls_output = D(inputs_embeds=hat_embeddings)
-    hat_real_fake_logits = hat_cls_output.real_fake_logits  # [B*T,]
+    hat_cls_output = D(inputs_embeds=hat_embeddings, Is_real=True)
+    hat_real_fake_loss = - hat_cls_output.real_fake_logits  # [B*T,]
     
     # Compute gradient of discriminator output w.r.t. interpolated embeddings
     # This measures the Lipschitz constant of the discriminator
     gradients = torch.autograd.grad(
-        outputs=hat_real_fake_logits.sum(),
+        outputs=hat_real_fake_loss.sum(),
         inputs=hat_embeddings,
         create_graph=True,
         retain_graph=True,
@@ -684,7 +684,7 @@ def compute_generator_loss(
     fake_embeddings = logits_to_embeddings_via_projection(fake_logits, projection_layer, vocab_size_list, hidden_size)  # [B, T, hidden_size]
     
     # Use embeddings directly as Discriminator input
-    fake_cls_output = D(inputs_embeds=fake_embeddings)
+    fake_cls_output = D(inputs_embeds=fake_embeddings, Is_real=True)
     
     # Calculation fake loss
     g_loss_fake = - torch.mean(fake_cls_output.real_fake_logits)
@@ -769,7 +769,7 @@ def compute_generator_loss(
         + lambda_cls * g_loss_cls 
         + lambda_rec * g_loss_rec
         + lambda_amadeus * g_loss_amadeus
-        + lambda_dispersive * g_loss_dispersive
+        #+ lambda_dispersive * g_loss_dispersive
     )
     
     loss_dict = {
@@ -777,7 +777,7 @@ def compute_generator_loss(
         'G/loss_cls': g_loss_cls.item() if isinstance(g_loss_cls, torch.Tensor) else g_loss_cls,
         'G/loss_rec': g_loss_rec.item(),
         'G/loss_amadeus': g_loss_amadeus.item(),
-        'G/loss_dispersive': g_loss_dispersive.item(),
+        #'G/loss_dispersive': g_loss_dispersive.item(),
         'G/loss_total': g_loss.item()
     }
     

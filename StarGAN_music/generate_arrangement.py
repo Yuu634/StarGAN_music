@@ -51,13 +51,14 @@ def get_argument_parser():
         description='Generate arrangement score data using StarGAN-trained Amadeus Generator'
     )
     
-    model_name = "MidiCaps-Genre-Nontrained"
+    model_name = "MidiCaps-GenreSmall-ParamsTuned-G_interval=10"
+    ver_name = "stargan_epoch0_step56614.pt"
     
     # Model and checkpoint paths
     parser.add_argument(
         '--model_path',
         type=str,
-        default=f"output/{model_name}/models/stargan_epoch0_step17531.pt",
+        default=f"output/{model_name}/models/{ver_name}",
         help='Path to StarGAN checkpoint containing trained Amadeus Generator'
     )
     parser.add_argument(
@@ -89,7 +90,7 @@ def get_argument_parser():
     parser.add_argument(
         '--target_domains',
         nargs='+',
-        default=['chillout', 'electropop', 'latin', 'popfolk', 'classical', 'metal', 'pop', 'poprock', 'drumnbass', 'celtic', 'newage', 'instrumentalpop', 'jazzfusion', 'alternative', 'lounge', 'funk', 'orchestral', 'blues', 'indie', 'house', 'instrumentalrock', 'world', 'trance', 'ambient', '80s', 'dance', 'experimental', 'rock', 'symphonic', 'reggae', 'punkrock', 'jazz', 'easylistening', 'country', 'soundtrack', 'folk', 'electronic', '90s', 'techno', 'hiphop', 'swing', 'synthpop'],
+        default=["classical", "rock"],
         help='List of target arrangement domains (e.g., "pop" "jazz" "classical")'
     )
     
@@ -283,31 +284,9 @@ def load_amadeus_generator(
     # Load model architecture and vocab
     model = prepare_amadeus_model(amadeus_config, vocab, device)
     
-    # Load pretrained weights from StarGAN checkpoint
-    #stargan_ckpt = load_stargan_checkpoint(model_path, device)
-    #generator_state = stargan_ckpt['state_dict']
-    
     ckpt = torch.load(model_path, map_location=device)
-    model.load_state_dict(ckpt['model'], strict=False)
+    model.load_state_dict(ckpt['generator_state_dict'], strict=False)
     print(f"Loaded checkpoint from {model_path}")
-    
-    # Load state dict into model
-    """print("Loading pretrained weights from StarGAN checkpoint...")
-    missing_keys, unexpected_keys = model.load_state_dict(generator_state, strict=False)
-    
-    if missing_keys:
-        print(f"  ⚠ Missing keys: {len(missing_keys)}")
-        if len(missing_keys) <= 10:
-            for key in missing_keys:
-                print(f"    - {key}")
-    
-    if unexpected_keys:
-        print(f"  ⚠ Unexpected keys: {len(unexpected_keys)}")
-        if len(unexpected_keys) <= 10:
-            for key in unexpected_keys:
-                print(f"    - {key}")
-    """
-    print("✓ Generator loaded successfully!")
     
     return model
 
