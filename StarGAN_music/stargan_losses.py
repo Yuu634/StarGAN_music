@@ -14,8 +14,22 @@ import sys
 
 sys.path.append("../Amadeus/Amadeus")
 from train_utils import dispersive_loss, NLLLoss4CompoundToken
+from utils import LogitsToMoonbeamEmbedding, logits_to_embed
 
 AMADEUS_FIELDS = ["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"]
+
+
+class MoonbeamProjectionAdapter(nn.Module):
+    """Project 6×hidden Moonbeam embeddings to discriminator hidden size."""
+
+    def __init__(self, moonbeam_combined_dim: int, hidden_size: int):
+        super().__init__()
+        self.projection = nn.Linear(moonbeam_combined_dim, hidden_size)
+        self.layer_norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, moonbeam_embeddings: torch.Tensor) -> torch.Tensor:
+        projected = self.projection(moonbeam_embeddings)
+        return self.layer_norm(projected)
 
 class StraightThroughEstimator(torch.autograd.Function):
     """
@@ -489,6 +503,8 @@ def compute_discriminator_loss(
     vocab_size_list,
     hidden_size,
     vocab_path,
+    moonbeam_converter: Optional[LogitsToMoonbeamEmbedding] = None,
+    moonbeam_adapter: Optional[MoonbeamProjectionAdapter] = None,
     lambda_cls=1.0,
     lambda_gp=10.0,
     temperature=0.5,
@@ -508,6 +524,8 @@ def compute_discriminator_loss(
         vocab_size_list: List of vocab sizes for each feature
         hidden_size: Discriminator hidden size
         vocab_path: Path to Amadeus vocabulary file
+        moonbeam_converter: Optional LogitsToMoonbeamEmbedding instance
+        moonbeam_adapter: Optional MoonbeamProjectionAdapter instance
         lambda_cls: Weight for domain classification loss
         lambda_gp: Weight for gradient penalty
         temperature: Temperature (unused in differentiable approach)
@@ -550,8 +568,7 @@ def compute_discriminator_loss(
     )
     # fake_logits: Dict of {feature: [B, T, vocab_size]}
     
-    # Convert Generator logits to embeddings via projection layer (FULLY DIFFERENTIABLE!)
-    fake_embeddings = logits_to_embeddings_via_projection(fake_logits, projection_layer, vocab_size_list, hidden_size)  # [B, T, hidden_size]
+    fake_embeddings = logits_to_embed(fake_logits, D, vocab_path)
     
     # Use embeddings directly as Discriminator input
     fake_cls_output = D(inputs_embeds=fake_embeddings, Is_real=False)
@@ -627,6 +644,8 @@ def compute_generator_loss(
     hidden_size,
     embedding_layers,
     emb_size,
+    moonbeam_converter: Optional[LogitsToMoonbeamEmbedding] = None,
+    moonbeam_adapter: Optional[MoonbeamProjectionAdapter] = None,
     lambda_cls=1.0,
     lambda_rec=10.0,
     temperature=0.5,
@@ -654,6 +673,8 @@ def compute_generator_loss(
         hidden_size: Discriminator hidden size
         embedding_layers: List of nn.Embedding layers (from MultiEmbedding._make_emb_layers)
         emb_size: Embedding size for each feature
+        moonbeam_converter: Optional LogitsToMoonbeamEmbedding instance
+        moonbeam_adapter: Optional MoonbeamProjectionAdapter instance
         lambda_cls: Weight for domain classification loss
         lambda_rec: Weight for reconstruction loss
         temperature: Temperature for Gumbel-Softmax sampling
@@ -680,8 +701,18 @@ def compute_generator_loss(
     )
     # fake_logits: Dict of {feature: [B, T, vocab_size]}
     
-    # Convert Generator logits to embeddings via projection layer (FULLY DIFFERENTIABLE!)
-    fake_embeddings = logits_to_embeddings_via_projection(fake_logits, projection_layer, vocab_size_list, hidden_size)  # [B, T, hidden_size]
+    # Convert Generator logits to embeddings via Moonbeam converter if provided
+    if moonbeam_converter is not None and moonbeam_adapter is not None:
+        moonbeam_device = next(moonbeam_converter.parameters()).device
+        fake_logits_moonbeam = {k: v.to(moonbeam_device) for k, v in fake_logits.items()}
+        moonbeam_out = moonbeam_converter(fake_logits_moonbeam)
+        moonbeam_combined = moonbeam_out["combined_embedding"]  # [B, T, 6*hidden_size]
+        fake_embeddings = moonbeam_adapter(moonbeam_combined)
+    else:
+        fake_embeddings = logits_to_embeddings_via_projection(fake_logits, projection_layer, vocab_size_list, hidden_size)  # [B, T, hidden_size]
+
+    if fake_embeddings.device != device:
+        fake_embeddings = fake_embeddings.to(device)
     
     # Use embeddings directly as Discriminator input
     fake_cls_output = D(inputs_embeds=fake_embeddings, Is_real=True)
@@ -813,6 +844,37 @@ def check_gradient_flow(model, name="Model"):
     print(f"  Params without grad: {no_grad_count}")
     print(f"  Average grad norm: {avg_norm:.6f}")
     print("=" * 50)
+
+
+def check_gradient_flow_for_moonbeam(generator, discriminator, embeddings):
+    """Verify gradients propagate through Moonbeam path."""
+    loss = discriminator(inputs_embeds=embeddings, Is_real=True).real_fake_logits.mean()
+    loss.backward(retain_graph=True)
+    for name, param in generator.named_parameters():
+        if param.grad is None:
+            return False
+    return True
+
+
+def check_numerical_stability(amadeus_logits: Dict[str, torch.Tensor], embeddings: torch.Tensor) -> bool:
+    """Detect NaN/Inf in logits and embeddings."""
+    for feat, logit in amadeus_logits.items():
+        if torch.isnan(logit).any() or torch.isinf(logit).any():
+            return False
+    if torch.isnan(embeddings).any() or torch.isinf(embeddings).any():
+        return False
+    return True
+
+
+def test_discriminator_compatibility(discriminator, embedding_shape: Tuple[int, int, int]) -> bool:
+    """Check if discriminator accepts the given embedding shape."""
+    B, T, hidden_size = embedding_shape
+    dummy = torch.randn(B, T, hidden_size, device=next(discriminator.parameters()).device)
+    try:
+        _ = discriminator(inputs_embeds=dummy, Is_real=True)
+        return True
+    except Exception:
+        return False
 
 
 def generate_target_domain(source_domains, num_samples=None):

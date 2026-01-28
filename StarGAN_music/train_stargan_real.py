@@ -31,10 +31,10 @@ from data_representation import vocab_utils
 from transformers import LlamaForSequenceClassification, LlamaConfig, T5Tokenizer, T5EncoderModel
 from src.llama_recipes.real_finetuning_player_classification import LlamaForSequenceDoubleClassification
 from scheduler import AdaptiveHyperparameterScheduler
-from utils import split_sequence_with_sliding_window, aggregate_window_outputs
+from utils import split_sequence_with_sliding_window, aggregate_window_outputs, LogitsToMoonbeamEmbedding
 
-# Import loss functions
-from stargan_losses import compute_discriminator_loss, compute_generator_loss
+# Import loss functions and Moonbeam adapter
+from stargan_losses import compute_discriminator_loss, compute_generator_loss, MoonbeamProjectionAdapter
 from data_loader import get_loader
 
 
@@ -159,6 +159,20 @@ class StarGANTrainer:
         # Store vocab sizes for later use in loss functions
         self.vocab_size_list = vocab_size_list
         self.amadeus_fields = amadeus_fields
+
+        # Moonbeam converter and adapter
+        print("Initializing Moonbeam converter and adapter...")
+        self.moonbeam_converter = LogitsToMoonbeamEmbedding(
+            amadeus_vocab_path=self.vocab_path,
+            moonbeam_model_path=self.d_modelpath,
+            moonbeam_hidden_size=hidden_size
+        ).to(self.device_d)
+        moonbeam_combined_dim = 6 * hidden_size
+        self.moonbeam_adapter = MoonbeamProjectionAdapter(
+            moonbeam_combined_dim=moonbeam_combined_dim,
+            hidden_size=hidden_size
+        ).to(self.device_d)
+        print(f"  Moonbeam converter loaded on {self.device_d} (hidden={hidden_size}, combined={moonbeam_combined_dim})")
         
         # Create embedding layers for logits_to_embedded_input function
         # Reference: MultiEmbedding._make_emb_layers() from transformer_utils.py
@@ -182,7 +196,12 @@ class StarGANTrainer:
             g_params = list(self.G.parameters()) + list(self.embedding_layers.parameters())
         else:
             g_params = list(self.G.parameters()) + list(self.embedding_layers.parameters())
-        d_params = list(self.D.parameters()) + list(self.projection_layer.parameters())
+        d_params = (
+            list(self.D.parameters())
+            + list(self.projection_layer.parameters())
+            + list(self.moonbeam_adapter.parameters())
+            + list(self.moonbeam_converter.parameters())
+        )
         
         self.g_optimizer = optim.Adam(g_params, lr=self.g_lr, betas=(0.5, 0.999))
         self.d_optimizer = optim.Adam(d_params, lr=self.d_lr, betas=(0.5, 0.999))
@@ -390,7 +409,8 @@ class StarGANTrainer:
         
         if (n_success + 1) % self.d_interval == 0:
             self.d_optimizer.zero_grad()
-            
+            #embed_weight = self.D.model.embed_tokens.weight
+            #print(embed_weight)
             d_loss, d_logs = compute_discriminator_loss(
                 G=self.G,
                 D=self.D,
@@ -401,6 +421,8 @@ class StarGANTrainer:
                 vocab_size_list=self.vocab_size_list,
                 hidden_size=self.D.config.hidden_size,
                 vocab_path=self.vocab_path,
+                moonbeam_converter=self.moonbeam_converter,
+                moonbeam_adapter=self.moonbeam_adapter,
                 lambda_cls=self.lambda_cls,
                 lambda_gp=self.lambda_gp,  # Use current value (may be updated by schedule)
                 temperature=self.temperature,
@@ -432,6 +454,8 @@ class StarGANTrainer:
                 hidden_size=self.D.config.hidden_size,
                 embedding_layers=self.embedding_layers,
                 emb_size=self.emb_size,
+                moonbeam_converter=self.moonbeam_converter,
+                moonbeam_adapter=self.moonbeam_adapter,
                 lambda_cls=self.lambda_cls,
                 lambda_rec=self.lambda_rec,
                 temperature=self.temperature,
@@ -795,9 +819,7 @@ def main():
     parser = argparse.ArgumentParser(description='StarGAN Training with Real Models')
     
     """<Experimental parameters>"""
-    #now_time = datetime.now().strftime('%Y%m%d_%H%M%S')
-    #model_name = f'MidiCaps-{now_time}'
-    model_name = 'MidiCaps-GenreSmall-ParamsTuned-G_interval=50_logits'
+    model_name = 'MidiCaps-GenreSmall-ConversionRevise'
     parser.add_argument('--Is_AmadeusRegressive', type=bool, default=False,
                         help='Whether to use Amadeus in regressive mode (True/False)')
     parser.add_argument('--g_interval', type=int, default=50, help='G update interval iterations')
@@ -830,9 +852,9 @@ def main():
     parser.add_argument('--resume_iters', type=int, default=None, help='resume training from this step')
     
     # Sliding window parameters for handling sequences longer than Amadeus max input length
-    parser.add_argument('--window_size', type=int, default=512,
-                       help='sliding window size (default: 3072, Amadeus max input length)')
-    parser.add_argument('--window_stride', type=int, default=512,
+    parser.add_argument('--window_size', type=int, default=1024,
+                       help='sliding window size (default: 2048, Amadeus max input length)')
+    parser.add_argument('--window_stride', type=int, default=1024,
                        help='sliding window stride (default: None = window_size, no overlap)')
     parser.add_argument('--window_aggregation', type=str, default='mean',
                        choices=['mean', 'max', 'first'],

@@ -1,0 +1,13 @@
+{
+  "total_samples": 10,
+  "target_domains": [
+    "classical",
+    "rock"
+  ],
+  "sampling_params": {
+    "method": "top_p",
+    "threshold": 0.99,
+    "temperature": 1.2
+  },
+  "generations": []
+}

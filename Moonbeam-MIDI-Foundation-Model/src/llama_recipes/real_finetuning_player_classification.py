@@ -181,11 +181,11 @@ class LlamaForSequenceDoubleClassification(
         # Initialize weights and apply final processing
         self.post_init()
 
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
+    #def get_input_embeddings(self):
+    #    return self.model.embed_tokens
 
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
+    #def set_input_embeddings(self, value):
+    #    self.model.embed_tokens = value
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(
