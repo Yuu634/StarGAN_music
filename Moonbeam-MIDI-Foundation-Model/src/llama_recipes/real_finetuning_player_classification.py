@@ -223,8 +223,9 @@ class LlamaForSequenceDoubleClassification(
             return_dict=return_dict,
             cache_position=None,
         )
-
         hidden_states = transformer_outputs[0]
+        print(hidden_states.shape)
+        print(hidden_states[-1])
         logits = self.score(hidden_states)
         # 追加: 真偽分類スコア
         real_fake_logits = self.real_fake_score(hidden_states)
@@ -234,8 +235,8 @@ class LlamaForSequenceDoubleClassification(
         else:
             batch_size = inputs_embeds.shape[0]
 
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+        #if self.config.pad_token_id is None and batch_size != 1:
+        #    raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
         if self.config.pad_token_id is None:
             sequence_lengths = -1
         else:
@@ -395,7 +396,7 @@ def main(**kwargs):
         llama_config = LlamaConfig.from_pretrained(model_config_path)
         llama_config.use_cache = use_cache
         print(f"model_config:{llama_config}")
-        model = LlamaForSequenceDoubleClassification(llama_config) #TODO: LOAD FROM CKPT
+        model = LlamaForSequenceClassification(llama_config) #TODO: LOAD FROM CKPT
 
         model_checkpoint = torch.load(train_config.trained_checkpoint_path) #, , map_location = 'cuda:{}'.format(local_rank)
         
@@ -504,6 +505,8 @@ def main(**kwargs):
         dataset_config,
         split="train",
     )
+    print("Test")
+    print(dataset_train[0])
 
     if not train_config.enable_fsdp or rank == 0:
         print(f"--> Training Set Length = {len(dataset_train)}")

@@ -31,10 +31,10 @@ from data_representation import vocab_utils
 from transformers import LlamaForSequenceClassification, LlamaConfig, T5Tokenizer, T5EncoderModel
 from src.llama_recipes.real_finetuning_player_classification import LlamaForSequenceDoubleClassification
 from scheduler import AdaptiveHyperparameterScheduler
-from utils import split_sequence_with_sliding_window, aggregate_window_outputs, LogitsToMoonbeamEmbedding
+from utils import split_sequence_with_sliding_window, aggregate_window_outputs
 
 # Import loss functions and Moonbeam adapter
-from stargan_losses import compute_discriminator_loss, compute_generator_loss, MoonbeamProjectionAdapter
+from stargan_losses import compute_discriminator_loss, compute_generator_loss
 from data_loader import get_loader
 
 
@@ -161,7 +161,7 @@ class StarGANTrainer:
         self.amadeus_fields = amadeus_fields
 
         # Moonbeam converter and adapter
-        print("Initializing Moonbeam converter and adapter...")
+        """print("Initializing Moonbeam converter and adapter...")
         self.moonbeam_converter = LogitsToMoonbeamEmbedding(
             amadeus_vocab_path=self.vocab_path,
             moonbeam_model_path=self.d_modelpath,
@@ -173,6 +173,7 @@ class StarGANTrainer:
             hidden_size=hidden_size
         ).to(self.device_d)
         print(f"  Moonbeam converter loaded on {self.device_d} (hidden={hidden_size}, combined={moonbeam_combined_dim})")
+        """
         
         # Create embedding layers for logits_to_embedded_input function
         # Reference: MultiEmbedding._make_emb_layers() from transformer_utils.py
@@ -199,8 +200,6 @@ class StarGANTrainer:
         d_params = (
             list(self.D.parameters())
             + list(self.projection_layer.parameters())
-            + list(self.moonbeam_adapter.parameters())
-            + list(self.moonbeam_converter.parameters())
         )
         
         self.g_optimizer = optim.Adam(g_params, lr=self.g_lr, betas=(0.5, 0.999))
@@ -414,6 +413,7 @@ class StarGANTrainer:
             d_loss, d_logs = compute_discriminator_loss(
                 G=self.G,
                 D=self.D,
+                D_config=self.D.config,
                 real_scores=real_scores,
                 context=target_context,
                 real_labels=real_labels,
@@ -421,8 +421,6 @@ class StarGANTrainer:
                 vocab_size_list=self.vocab_size_list,
                 hidden_size=self.D.config.hidden_size,
                 vocab_path=self.vocab_path,
-                moonbeam_converter=self.moonbeam_converter,
-                moonbeam_adapter=self.moonbeam_adapter,
                 lambda_cls=self.lambda_cls,
                 lambda_gp=self.lambda_gp,  # Use current value (may be updated by schedule)
                 temperature=self.temperature,
@@ -454,8 +452,6 @@ class StarGANTrainer:
                 hidden_size=self.D.config.hidden_size,
                 embedding_layers=self.embedding_layers,
                 emb_size=self.emb_size,
-                moonbeam_converter=self.moonbeam_converter,
-                moonbeam_adapter=self.moonbeam_adapter,
                 lambda_cls=self.lambda_cls,
                 lambda_rec=self.lambda_rec,
                 temperature=self.temperature,

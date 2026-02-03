@@ -1,25 +1,9 @@
-import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import re
 from typing import Dict, Tuple, List, Optional
-
-# Amadeus feature order used across the project
-AMADEUS_FIELDS = [
-    "type",
-    "beat",
-    "chord",
-    "tempo",
-    "instrument",
-    "pitch",
-    "duration",
-    "velocity",
-]
-
-# Alias to keep existing helpers working (there is a typo in older code)
-AMAEDEUS_FIELDS = AMADEUS_FIELDS
 
 def split_sequence_with_sliding_window(sequence, window_size=3072, stride=None):
     """
@@ -127,7 +111,193 @@ def amadeus_to_vocab(self, amadeus_tokens: torch.Tensor, vocab_path: str) -> np.
         decoded[:, axis] = lookup[tokens_np[:, axis]]
 
     return decoded
+
+import json
+def logits_to_embed(logits, D, vocab_path):
+    with open(vocab_path, "r", encoding="utf-8") as f:
+        vocab = json.load(f)
+    
+    # Moonbeamの各埋め込み重み取得
+    weight = D.model.embed_tokens.weight  # [32000, 1536]
+    start = 0
+    embed_list = {}
+    for field in ["onset", "dur", "octave", "pitch_class", "instrument", "velocity"]:
+        vocab_size = getattr(D.config, f"{field}_vocab_size")
+        embed_list[field] = weight[start : start+vocab_size]
+        start += vocab_size
+
+    # Generator出力確率取得
+    probs = {}
+    for key in logits.keys():
+        probs[key] = F.softmax(logits[key], dim=-1)
+    
+    # 最大確率トークン取得
+    type_probs = probs['type']  # [B, T, num_type_vocab]
+    type_tokens = torch.argmax(type_probs, dim=-1)  # [B, T]
+    tempo_probs = probs['tempo']  # [B, T, num_tempo_vocab]
+    tempo_tokens = torch.argmax(tempo_probs, dim=-1)  # [B, T]
+    
+    # 各音符における小節数onset算出
+    """
+    onset_list = []
+    for b in range(type_tokens.shape[0]):
+        onset_counts = 0
+        onset_seq = []
+        numerator, denominator = 4, 4
+        for t in range(type_tokens.shape[1]):
+            tempo_idx = tempo_tokens[b, t].item()
+            tempo_str = vocab['tempo'][str(tempo_idx)]
+            if tempo_str.startswith('Tempo_'):
+                current_tempo = int(tempo_str.split('Tempo_')[1])
+            
+            type_idx = type_tokens[b, t].item()
+            type_str = vocab['type'][str(type_idx)]
+            if type_str.startswith('NNN_time_signature_'):
+                current_beat = int(type_str.split('NNN_time_signature_')[1])
+                numerator, denominator = int(current_beat.split('/')[0]), int(current_beat.split('/')[1])
+                quarter_per_bar = numerator * (4.0 / denominator)
+                ms_per_quarter = 60000.0 / current_tempo
+                onset_counts += quarter_per_bar * ms_per_quarter / 10
+            elif type_str == 'SNN':
+                quarter_per_bar = numerator * (4.0 / denominator)
+                ms_per_quarter = 60000.0 / current_tempo
+                onset_counts += quarter_per_bar * ms_per_quarter / 10
+                
+            # SSN and SSS do not change onset count
+            onset_seq.append(onset_counts)
+        onset_list.append(onset_seq)
+    """
+    
+    ### onset 埋め込みの混合埋め込みを算出 ###
+    #onset_probs = probs['type']
+    #onset_mix = torch.einsum('btv,vh->bth', onset_probs, embed_list['onset'])
+    pitch_probs = probs['pitch']
+    
+    pitch_value_map = []
+    for idx in range(len(vocab['pitch'])):
+        token = vocab['pitch'][str(idx)]
+        if isinstance(token, str) and token.startswith('Note_Pitch_'):
+            val = int(token.split('Note_Pitch_')[1])
+            val = val // 12
+        else:
+            val = idx
+        # 埋め込み表の範囲に収まるようクリップ
+        val = max(0, min(val, embed_list['octave'].shape[0] - 1))
+        pitch_value_map.append(val)
+    pitch_value_map = torch.tensor(pitch_value_map, device=pitch_probs.device)
+    # idx -> pitch_class value で埋め込みテーブルを並べ替えたもの
+    octave_table = embed_list['octave'].index_select(0, pitch_value_map)  # [V_pc, H]
+    # pitch_class_probs と pitch_class_table の全組み合わせを掛けて idx 方向に総和を取る
+    onset_mix = torch.einsum('btv,vh->bth', pitch_probs, octave_table)  # [B, T, H]
    
+    
+    ### duration 埋め込みの混合埋め込みを算出 ###
+    #duration_probs = probs['beat']
+    #duration_mix = torch.einsum('btv,vh->bth', duration_probs, embed_list['dur'])
+    pitch_probs = probs['pitch']
+    
+    pitch_value_map = []
+    for idx in range(len(vocab['pitch'])):
+        token = vocab['pitch'][str(idx)]
+        if isinstance(token, str) and token.startswith('Note_Pitch_'):
+            val = int(token.split('Note_Pitch_')[1])
+            val = val // 12
+        else:
+            val = idx
+        # 埋め込み表の範囲に収まるようクリップ
+        val = max(0, min(val, embed_list['octave'].shape[0] - 1))
+        pitch_value_map.append(val)
+    pitch_value_map = torch.tensor(pitch_value_map, device=pitch_probs.device)
+    # idx -> pitch_class value で埋め込みテーブルを並べ替えたもの
+    octave_table = embed_list['octave'].index_select(0, pitch_value_map)  # [V_pc, H]
+    # pitch_class_probs と pitch_class_table の全組み合わせを掛けて idx 方向に総和を取る
+    duration_mix = torch.einsum('btv,vh->bth', pitch_probs, octave_table)  # [B, T, H]
+
+
+    ### octave 埋め込みの混合埋め込みを算出 ###
+    pitch_probs = probs['pitch']
+    
+    pitch_value_map = []
+    for idx in range(len(vocab['pitch'])):
+        token = vocab['pitch'][str(idx)]
+        if isinstance(token, str) and token.startswith('Note_Pitch_'):
+            val = int(token.split('Note_Pitch_')[1])
+            val = val // 12
+        else:
+            val = idx
+        # 埋め込み表の範囲に収まるようクリップ
+        val = max(0, min(val, embed_list['octave'].shape[0] - 1))
+        pitch_value_map.append(val)
+    pitch_value_map = torch.tensor(pitch_value_map, device=pitch_probs.device)
+    # idx -> pitch_class value で埋め込みテーブルを並べ替えたもの
+    octave_table = embed_list['octave'].index_select(0, pitch_value_map)  # [V_pc, H]
+    # pitch_class_probs と pitch_class_table の全組み合わせを掛けて idx 方向に総和を取る
+    octave_mix = torch.einsum('btv,vh->bth', pitch_probs, octave_table)  # [B, T, H]
+    
+    
+    ### pitch_class 埋め込みの混合埋め込みを算出 ###
+    pitch_probs = probs['pitch']
+    
+    pitch_value_map = []
+    for idx in range(len(vocab['pitch'])):
+        token = vocab['pitch'][str(idx)]
+        if isinstance(token, str) and token.startswith('Note_Pitch_'):
+            val = int(token.split('Note_Pitch_')[1])
+            val = val % 12
+        else:
+            val = idx
+        # 埋め込み表の範囲に収まるようクリップ
+        val = max(0, min(val, embed_list['pitch_class'].shape[0] - 1))
+        pitch_value_map.append(val)
+    pitch_value_map = torch.tensor(pitch_value_map, device=pitch_probs.device)
+    # idx -> pitch_class value で埋め込みテーブルを並べ替えたもの
+    pitch_class_table = embed_list['pitch_class'].index_select(0, pitch_value_map)  # [V_pc, H]
+    # pitch_class_probs と pitch_class_table の全組み合わせを掛けて idx 方向に総和を取る
+    pitch_class_mix = torch.einsum('btv,vh->bth', pitch_probs, pitch_class_table)  # [B, T, H]
+    
+    
+    ### instrument 埋め込みの混合埋め込みを算出 ###
+    instrument_probs = probs['instrument']
+    
+    instrument_value_map = []
+    for idx in range(len(vocab['instrument'])):
+        token = vocab['instrument'][str(idx)]
+        if isinstance(token, str) and token.startswith('Instrument_'):
+            val = int(token.split('Instrument_')[1])
+        else:
+            val = idx
+        # 埋め込み表の範囲に収まるようクリップ
+        val = max(0, min(val, embed_list['instrument'].shape[0] - 1))
+        instrument_value_map.append(val)
+    instrument_value_map = torch.tensor(instrument_value_map, device=instrument_probs.device)
+    # idx -> instrument value で埋め込みテーブルを並べ替えたもの
+    instrument_table = embed_list['instrument'].index_select(0, instrument_value_map)  # [V_inst, H]
+    # instrument_probs と instrument_table の全組み合わせを掛けて idx 方向に総和を取る
+    instrument_mix = torch.einsum('btv,vh->bth', instrument_probs, instrument_table)  # [B, T, H]
+    
+    
+    ### velocity 埋め込みの混合埋め込みを算出 ###
+    velocity_probs = probs['velocity']  # [B, T, V_vel]
+
+    velocity_value_map = []
+    for idx in range(len(vocab['velocity'])):
+        token = vocab['velocity'][str(idx)]
+        if isinstance(token, str) and token.startswith('Note_Velocity_'):
+            val = int(token.split('Note_Velocity_')[1])
+        else:
+            val = idx
+        # 埋め込み表の範囲に収まるようクリップ
+        val = max(0, min(val, embed_list['velocity'].shape[0] - 1))
+        velocity_value_map.append(val)
+    velocity_value_map = torch.tensor(velocity_value_map, device=velocity_probs.device)
+    # idx -> velocity value で埋め込みテーブルを並べ替えたもの
+    velocity_table = embed_list['velocity'].index_select(0, velocity_value_map)  # [V_vel, H]
+    # velocity_probs と velocity_table の全組み合わせを掛けて idx 方向に総和を取る
+    velocity_mix = torch.einsum('btv,vh->bth', velocity_probs, velocity_table)  # [B, T, H]
+
+    # 4つの mixture を連結して返す
+    return torch.cat([onset_mix, duration_mix, octave_mix, pitch_class_mix, instrument_mix, velocity_mix], dim=-1)
+        
 def _tie_moonbeam_embeddings(model: nn.Module):
     """
     学習中のMoonbeamモデルからEmbeddingを共有して参照する。
@@ -665,262 +835,3 @@ def vocab_to_moonbeam(self, amadeus_vocabs, time_resolution=10, default_tempo=12
         moonbeam_tokens = moonbeam_np
     
     return moonbeam_tokens
-
-
-def _ordered_vocab_list(field_dict: Dict[str, str]) -> List:
-    """Convert vocab dictionary (str index -> token) into an ordered list."""
-    items = sorted(((int(k), v) for k, v in field_dict.items()), key=lambda x: x[0])
-    return [v for _, v in items]
-
-
-def _get_moonbeam_embedding_layer(model: nn.Module, candidates: List[str]) -> nn.Embedding:
-    """Fetch an embedding layer from the Moonbeam model by trying candidate names."""
-    for name in candidates:
-        if hasattr(model, name):
-            layer = getattr(model, name)
-            if isinstance(layer, nn.Embedding):
-                return layer
-    # Fallback: build from state_dict if the attribute name differs
-    sd = model.state_dict()
-    for name in candidates:
-        key = f"{name}.weight"
-        if key in sd:
-            weight = sd[key]
-            return nn.Embedding.from_pretrained(weight, freeze=False)
-    raise AttributeError(f"Moonbeam embedding not found for candidates: {candidates}")
-
-
-def logits_to_moonbeam_embeddings(
-    amadeus_logits: Dict[str, torch.Tensor],
-    moonbeam_model: nn.Module,
-    vocab_path: str,
-    time_resolution: float = 10.0,
-    in_beat_resolution: int = 4,
-    default_tempo: int = 120,
-    max_onset_value: int = 1024,
-    max_duration_value: int = 1024,
-) -> Dict[str, torch.Tensor]:
-    """
-    Convert Amadeus logits (Generator outputs) into Moonbeam embeddings for the Discriminator.
-
-    Flow:
-    1) Load Amadeus vocab and build value lookups for each field.
-    2) Softmax logits to probabilities; bar progression uses argmax(type).
-    3) Build token probability distributions for Moonbeam attributes.
-    4) Probability-weighted sum with Moonbeam embedding tables → concat.
-
-    Returns a dict with per-attribute embeddings and concatenated embedding.
-    """
-    required_keys = AMADEUS_FIELDS
-    for key in required_keys:
-        if key not in amadeus_logits:
-            raise KeyError(f"Missing logits for field: {key}")
-
-    # Load vocab once per call
-    with open(vocab_path, "r", encoding="utf-8") as f:
-        vocab = json.load(f)
-
-    type_tokens = _ordered_vocab_list(vocab["type"])
-    beat_tokens = _ordered_vocab_list(vocab["beat"])
-    tempo_tokens = _ordered_vocab_list(vocab["tempo"])
-    pitch_tokens = _ordered_vocab_list(vocab["pitch"])
-    duration_tokens = _ordered_vocab_list(vocab["duration"])
-    instrument_tokens = _ordered_vocab_list(vocab["instrument"])
-    velocity_tokens = _ordered_vocab_list(vocab["velocity"])
-
-    # Build lookup dictionaries
-    nnn_indices = [i for i, tok in enumerate(type_tokens) if isinstance(tok, str) and tok.startswith("NNN_time_signature_")]
-    snn_index = next((i for i, tok in enumerate(type_tokens) if tok == "SNN"), None)
-
-    beat_vocab_indices: Dict[int, int] = {}
-    for idx, tok in enumerate(beat_tokens):
-        if isinstance(tok, str):
-            m = re.search(r"Beat_(\d+)", tok)
-            beat_vocab_indices[idx] = int(m.group(1)) if m else 0
-        else:
-            beat_vocab_indices[idx] = int(tok)
-
-    tempo_vocab_indices: Dict[int, int] = {}
-    for idx, tok in enumerate(tempo_tokens):
-        if isinstance(tok, str):
-            m = re.search(r"Tempo_(\d+)", tok)
-            tempo_vocab_indices[idx] = int(m.group(1)) if m else 0
-        else:
-            tempo_vocab_indices[idx] = int(tok)
-
-    pitch_vocab_indices: Dict[int, int] = {}
-    for idx, tok in enumerate(pitch_tokens):
-        if isinstance(tok, str):
-            m = re.search(r"Note_Pitch_(\d+)", tok)
-            pitch_vocab_indices[idx] = int(m.group(1)) if m else 0
-        else:
-            pitch_vocab_indices[idx] = int(tok)
-
-    duration_vocab_indices: Dict[int, float] = {}
-    for idx, tok in enumerate(duration_tokens):
-        if isinstance(tok, str):
-            m = re.search(r"Note_Duration_([\d.]+)", tok)
-            duration_vocab_indices[idx] = float(m.group(1)) if m else 0.0
-        else:
-            duration_vocab_indices[idx] = float(tok)
-
-    instrument_vocab_indices: Dict[int, int] = {}
-    for idx, tok in enumerate(instrument_tokens):
-        if isinstance(tok, str):
-            m = re.search(r"Instrument_(\d+)", tok)
-            instrument_vocab_indices[idx] = int(m.group(1)) if m else 0
-        else:
-            instrument_vocab_indices[idx] = int(tok)
-
-    velocity_vocab_indices: Dict[int, int] = {}
-    for idx, tok in enumerate(velocity_tokens):
-        if isinstance(tok, str):
-            m = re.search(r"Note_Velocity_(\d+)", tok)
-            velocity_vocab_indices[idx] = int(m.group(1)) if m else 0
-        else:
-            velocity_vocab_indices[idx] = int(tok)
-
-    # Probabilities from logits
-    type_probs = F.softmax(amadeus_logits["type"], dim=-1)
-    beat_probs = F.softmax(amadeus_logits["beat"], dim=-1)
-    tempo_probs = F.softmax(amadeus_logits["tempo"], dim=-1)
-    pitch_probs = F.softmax(amadeus_logits["pitch"], dim=-1)
-    duration_probs = F.softmax(amadeus_logits["duration"], dim=-1)
-    instrument_probs = F.softmax(amadeus_logits["instrument"], dim=-1)
-    velocity_probs = F.softmax(amadeus_logits["velocity"], dim=-1)
-
-    batch_size, seq_len, _ = type_probs.shape
-    device = type_probs.device
-
-    # ===== Bar progression via argmax(type) =====
-    bar_counts = torch.zeros(batch_size, seq_len, device=device)
-    nnn_tensor = torch.as_tensor(nnn_indices, device=device, dtype=torch.long) if len(nnn_indices) > 0 else None
-    snn_val = torch.tensor(snn_index, device=device) if snn_index is not None else None
-
-    for t in range(1, seq_len):
-        max_type_idx = torch.argmax(type_probs[:, t, :], dim=-1)  # [B]
-        bar_advance = torch.zeros(batch_size, device=device, dtype=torch.bool)
-        if nnn_tensor is not None:
-            bar_advance |= (max_type_idx.unsqueeze(-1) == nnn_tensor).any(dim=-1)
-        if snn_val is not None:
-            bar_advance |= max_type_idx == snn_val
-        bar_counts[:, t] = bar_counts[:, t - 1] + bar_advance.float()
-
-    # ===== Build Moonbeam token probabilities =====
-    onset_probs = torch.zeros(batch_size, seq_len, max_onset_value, device=device)
-    duration_out_probs = torch.zeros(batch_size, seq_len, max_duration_value, device=device)
-    octave_probs = torch.zeros(batch_size, seq_len, 12, device=device)  # 0-11 inclusive
-    pitch_class_probs = torch.zeros(batch_size, seq_len, 12, device=device)
-    instrument_out_probs = torch.zeros(batch_size, seq_len, 129, device=device)  # 0-128
-    velocity_out_probs = torch.zeros(batch_size, seq_len, 128, device=device)
-
-    subdivisions_per_bar = 4.0 * (4.0 / 4.0) * in_beat_resolution  # default 4/4
-
-    # Precompute tempo values tensor for argmax gather in duration path
-    tempo_value_list = [tempo_vocab_indices[i] for i in range(len(tempo_vocab_indices))]
-    tempo_value_tensor = torch.tensor(tempo_value_list, device=device, dtype=torch.float)
-
-    for t in range(seq_len):
-        bars_t = bar_counts[:, t]  # [B]
-        beat_prob_t = beat_probs[:, t]  # [B, beat_vocab]
-        tempo_prob_t = tempo_probs[:, t]  # [B, tempo_vocab]
-        duration_prob_t = duration_probs[:, t]  # [B, duration_vocab]
-        pitch_prob_t = pitch_probs[:, t]
-        instrument_prob_t = instrument_probs[:, t]
-        velocity_prob_t = velocity_probs[:, t]
-
-        # Onset: combine beat and tempo probabilities; bar progression is deterministic above
-        for beat_idx, beat_value in beat_vocab_indices.items():
-            beat_weight = beat_prob_t[:, beat_idx]
-            for tempo_idx, tempo_value in tempo_vocab_indices.items():
-                tempo_val = float(tempo_value) if tempo_value > 0 else float(default_tempo)
-                tempo_weight = tempo_prob_t[:, tempo_idx]
-                onset_in_subdivisions = bars_t * subdivisions_per_bar + beat_value  # [B]
-                onset_in_quarter_notes = onset_in_subdivisions / in_beat_resolution
-                onset_ms = onset_in_quarter_notes * (60000.0 / tempo_val)
-                onset_token = torch.round(onset_ms / time_resolution).long()
-                onset_token = torch.clamp(onset_token, 0, max_onset_value - 1)
-                prob = beat_weight * tempo_weight
-                for b in range(batch_size):
-                    onset_probs[b, t, onset_token[b]] += prob[b]
-
-        # Duration: use tempo argmax as specified
-        tempo_argmax_idx = torch.argmax(tempo_prob_t, dim=-1)  # [B]
-        tempo_argmax_val = tempo_value_tensor[tempo_argmax_idx]
-        tempo_argmax_val = torch.clamp(tempo_argmax_val, min=1.0)  # avoid divide-by-zero
-        for dur_idx, dur_value in duration_vocab_indices.items():
-            dur_weight = duration_prob_t[:, dur_idx]
-            duration_in_quarter_notes = float(dur_value) / in_beat_resolution
-            duration_ms = duration_in_quarter_notes * (60000.0 / tempo_argmax_val)
-            duration_token = torch.round(duration_ms / time_resolution).long()
-            duration_token = torch.clamp(duration_token, 1, max_duration_value - 1)
-            for b in range(batch_size):
-                duration_out_probs[b, t, duration_token[b]] += dur_weight[b]
-
-        # Octave & pitch_class from pitch probabilities
-        for pitch_idx, pitch_value in pitch_vocab_indices.items():
-            octave = pitch_value // 12
-            pitch_class = pitch_value % 12
-            octave = min(octave, 11)
-            prob = pitch_prob_t[:, pitch_idx]
-            octave_probs[:, t, octave] += prob
-            pitch_class_probs[:, t, pitch_class] += prob
-
-        # Instrument
-        for inst_idx, inst_value in instrument_vocab_indices.items():
-            inst_value = min(inst_value, instrument_out_probs.shape[-1] - 1)
-            instrument_out_probs[:, t, inst_value] += instrument_prob_t[:, inst_idx]
-
-        # Velocity
-        for vel_idx, vel_value in velocity_vocab_indices.items():
-            vel_value = min(vel_value, velocity_out_probs.shape[-1] - 1)
-            velocity_out_probs[:, t, vel_value] += velocity_prob_t[:, vel_idx]
-
-    # ===== Embedding lookup (probability-weighted) =====
-    emb_device = next(moonbeam_model.parameters()).device
-    onset_embedding = _get_moonbeam_embedding_layer(moonbeam_model, ["onset_embedding"]).to(emb_device)
-    duration_embedding = _get_moonbeam_embedding_layer(moonbeam_model, ["dur_embedding", "duration_embedding"]).to(emb_device)
-    octave_embedding = _get_moonbeam_embedding_layer(moonbeam_model, ["octave_embedding"]).to(emb_device)
-    pitch_class_embedding = _get_moonbeam_embedding_layer(moonbeam_model, ["pitch_embedding", "pitch_class_embedding"]).to(emb_device)
-    instrument_embedding = _get_moonbeam_embedding_layer(moonbeam_model, ["instrument_embedding"]).to(emb_device)
-    velocity_embedding = _get_moonbeam_embedding_layer(moonbeam_model, ["velocity_embedding"]).to(emb_device)
-
-    # Move prob tensors to embedding device if needed
-    def _move(x: torch.Tensor) -> torch.Tensor:
-        return x.to(emb_device) if x.device != emb_device else x
-
-    onset_probs = _move(onset_probs)
-    duration_out_probs = _move(duration_out_probs)
-    octave_probs = _move(octave_probs)
-    pitch_class_probs = _move(pitch_class_probs)
-    instrument_out_probs = _move(instrument_out_probs)
-    velocity_out_probs = _move(velocity_out_probs)
-
-    onset_emb = torch.einsum("btk,kh->bth", onset_probs, onset_embedding.weight)
-    duration_emb = torch.einsum("btk,kh->bth", duration_out_probs, duration_embedding.weight)
-    octave_emb = torch.einsum("btk,kh->bth", octave_probs, octave_embedding.weight)
-    pitch_class_emb = torch.einsum("btk,kh->bth", pitch_class_probs, pitch_class_embedding.weight)
-    instrument_emb = torch.einsum("btk,kh->bth", instrument_out_probs, instrument_embedding.weight)
-    velocity_emb = torch.einsum("btk,kh->bth", velocity_out_probs, velocity_embedding.weight)
-
-    combined = torch.cat(
-        [onset_emb, duration_emb, octave_emb, pitch_class_emb, instrument_emb, velocity_emb],
-        dim=-1,
-    )
-
-    return {
-        "combined": combined,
-        "onset_emb": onset_emb,
-        "duration_emb": duration_emb,
-        "octave_emb": octave_emb,
-        "pitch_class_emb": pitch_class_emb,
-        "instrument_emb": instrument_emb,
-        "velocity_emb": velocity_emb,
-        "onset_probs": onset_probs,
-        "duration_probs": duration_out_probs,
-        "octave_probs": octave_probs,
-        "pitch_class_probs": pitch_class_probs,
-        "instrument_probs": instrument_out_probs,
-        "velocity_probs": velocity_out_probs,
-        "bar_counts": bar_counts,
-    }

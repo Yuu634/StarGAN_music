@@ -1,4 +1,6 @@
 #!/bin/bash
+export CUDA_LAUNCH_BLOCKING=1
+export TORCH_USE_CUDA_DSA=1
 torchrun --nnodes 1 --nproc_per_node 1 recipes/finetuning/real_finetuning_player_classification.py \
   --lr 2e-4 \
   --val_batch_size 22 \
@@ -10,7 +12,7 @@ torchrun --nnodes 1 --nproc_per_node 1 recipes/finetuning/real_finetuning_player
   --trained_checkpoint_path "models/pretrained/moonbeam_839M.pt" \
   --pure_bf16 True \
   --enable_ddp True \
-  --use_peft True \
+  --use_peft False \
   --peft_method lora \
   --quantization False \
   --model_name "Emotion-classify" \

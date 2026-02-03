@@ -347,6 +347,7 @@ class MusicEmotionClassifier:
         if len(tokens) <= chunk_length:
             # 短い場合は従来の方法
             tokens_tensor = self.npy_to_tokens(npy_path, max_length=chunk_length+1)
+            print(tokens_tensor)
             tokens_tensor = tokens_tensor.to(self.device)
             with torch.no_grad():
                 outputs = self.model(input_ids=tokens_tensor)

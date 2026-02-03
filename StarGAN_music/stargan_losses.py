@@ -14,7 +14,7 @@ import sys
 
 sys.path.append("../Amadeus/Amadeus")
 from train_utils import dispersive_loss, NLLLoss4CompoundToken
-from utils import LogitsToMoonbeamEmbedding, logits_to_embed
+from utils import logits_to_moonbeam_embeddings
 
 AMADEUS_FIELDS = ["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"]
 
@@ -174,9 +174,9 @@ def _build_lookup_table(field_dict: dict) -> np.ndarray:
     for k, v in field_dict.items():
         table[int(k)] = v
     return np.array(table, dtype=object)
-
+"""
 def amadeus_to_vocab(amadeus_tokens: torch.Tensor, vocab_path: str) -> np.ndarray:
-    """Convert Amadeus token indices to vocabulary strings"""
+    Convert Amadeus token indices to vocabulary string
     with open(vocab_path, "r", encoding="utf-8") as f:
         vocab = json.load(f)
 
@@ -200,7 +200,7 @@ def amadeus_to_vocab(amadeus_tokens: torch.Tensor, vocab_path: str) -> np.ndarra
     return decoded
 
 def vocab_to_moonbeam(amadeus_vocabs, time_resolution=10, default_tempo=120, in_beat_resolution=4):
-    """Convert Amadeus vocab strings to Moonbeam token indices"""
+    Convert Amadeus vocab strings to Moonbeam token indices
     # Convert to numpy for easier processing
     if isinstance(amadeus_vocabs, torch.Tensor):
         amadeus_np = amadeus_vocabs.cpu().numpy()
@@ -228,6 +228,7 @@ def vocab_to_moonbeam(amadeus_vocabs, time_resolution=10, default_tempo=120, in_
     if use_torch:
         return torch.from_numpy(moonbeam_np).long()
     return moonbeam_np
+    """
 
 def _vocab_to_moonbeam_single(amadeus_np, time_resolution, default_tempo, in_beat_resolution):
     """Convert single sequence from Amadeus vocab to Moonbeam indices"""
@@ -496,6 +497,7 @@ def tokens_to_embeddings_via_projection(amadeus_tokens, projection_layer, vocab_
 def compute_discriminator_loss(
     G,
     D,
+    D_config,
     real_scores,
     context,
     real_labels,
@@ -503,8 +505,6 @@ def compute_discriminator_loss(
     vocab_size_list,
     hidden_size,
     vocab_path,
-    moonbeam_converter: Optional[LogitsToMoonbeamEmbedding] = None,
-    moonbeam_adapter: Optional[MoonbeamProjectionAdapter] = None,
     lambda_cls=1.0,
     lambda_gp=10.0,
     temperature=0.5,
@@ -546,15 +546,33 @@ def compute_discriminator_loss(
     
     # ========== Real score processing ==========
     # Convert discrete Amadeus tokens to embeddings via projection layer (FULLY DIFFERENTIABLE!)
-    real_embeddings = tokens_to_embeddings_via_projection(real_scores, projection_layer, vocab_size_list, hidden_size)  # [B, T, hidden_size]
+    #real_embeddings = tokens_to_embeddings_via_projection(real_scores, projection_layer, vocab_size_list, hidden_size)  # [B, T, hidden_size]
+    vocab = amadeus_to_vocab(real_scores, vocab_path)
+    real_tokens = vocab_to_moonbeam(vocab)
+    real_tokens = torch.as_tensor(real_tokens, device=device, dtype=torch.long)
+    """sos_tokens = torch.full((B,6),D_config.sos_token, device=device)
+    eos_tokens = torch.full((B,6),D_config.eos_token, device=device)
+    cls_tokens = torch.full((B,6),D_config.classification_token, device=device)
+    real_tokens = torch.cat([
+        sos_tokens,
+        real_tokens,
+        eos_tokens,
+        cls_tokens
+    ], dim=-2)"""
+    #real_tokens = real_tokens.unsqueeze(0)
     
+    #print("real_tokens")
+    #print(real_tokens.shape)
+    #print(real_tokens)
     # Use embeddings directly as Discriminator input
-    real_cls_output = D(inputs_embeds=real_embeddings, Is_real=True)
+    real_cls_output = D(input_ids=real_tokens, Is_real=True)
     
     # Calculation real loss
     d_loss_real = - torch.mean(real_cls_output.real_fake_logits)
     
     real_cls_logits = real_cls_output.logits if hasattr(real_cls_output, 'logits') else real_cls_output["logits"]
+    print(real_cls_logits)
+    print(real_labels)
     d_loss_cls = F.binary_cross_entropy_with_logits(
         real_cls_logits,
         real_labels.float()
@@ -568,7 +586,7 @@ def compute_discriminator_loss(
     )
     # fake_logits: Dict of {feature: [B, T, vocab_size]}
     
-    fake_embeddings = logits_to_embed(fake_logits, D, vocab_path)
+    fake_embeddings = logits_to_moonbeam_embeddings(fake_logits, D, vocab_path)
     
     # Use embeddings directly as Discriminator input
     fake_cls_output = D(inputs_embeds=fake_embeddings, Is_real=False)
@@ -644,8 +662,6 @@ def compute_generator_loss(
     hidden_size,
     embedding_layers,
     emb_size,
-    moonbeam_converter: Optional[LogitsToMoonbeamEmbedding] = None,
-    moonbeam_adapter: Optional[MoonbeamProjectionAdapter] = None,
     lambda_cls=1.0,
     lambda_rec=10.0,
     temperature=0.5,
@@ -939,3 +955,375 @@ def setup_amadeus_losses(encoding_scheme='nb', feature_list=None, focal_alpha=1.
     )
     
     return amadeus_loss_fn
+
+
+AMAEDEUS_FIELDS = ["type", "beat", "chord", "tempo", "instrument", "pitch", "duration", "velocity"]
+def _build_lookup_table(field_dict: dict[str, str]) -> np.ndarray:
+    max_idx = max(int(k) for k in field_dict.keys())
+    table = ["" for _ in range(max_idx + 1)]
+    for k, v in field_dict.items():
+        table[int(k)] = v
+    return np.array(table, dtype=object)
+
+def amadeus_to_vocab(amadeus_tokens: torch.Tensor, vocab_path: str) -> np.ndarray:
+    """Amadeusのトークン列を語彙に変換し、amadeus_to_moonbeam利用可能な形式に"""
+    with open(vocab_path, "r", encoding="utf-8") as f:
+        vocab = json.load(f)
+
+    tokens_np = amadeus_tokens.detach().cpu().numpy().astype(np.int64)
+    decoded = np.empty(tokens_np.shape, dtype=object)
+
+    for axis, field in enumerate(AMAEDEUS_FIELDS):
+        lookup = _build_lookup_table(vocab[field])
+        decoded[:, :, axis] = lookup[tokens_np[:, :, axis]]
+
+    return decoded
+
+
+def vocab_to_moonbeam(amadeus_vocabs, time_resolution=10, default_tempo=120, in_beat_resolution=4):
+    # (Beat + 小節数) * Tempo → onset(ms)
+    # duration * Tempo → duration(ms)
+    # pitch → octave*12 + pitch_class
+    
+    # Amadeus表現：(type, beat, chord, tempo, instrument, pitch, duration, velocity)
+    """
+    Type：拍子の変化や継続の組み合わせの違いをそれぞれ表すもの。
+    Beat：同一小節内における音符の相対的な位置。
+    Chord：現在の音符が属している和音。
+    Tempo：音符の再生速度。一般に、テンポが高いほど楽曲は速くなる。
+    Instrument：現在の音符を演奏している楽器。
+    Pitch：音符の高さ。MIDI仕様に基づく128段階の離散値で表される。
+    Duration：音符が演奏される長さ（継続時間）。
+    Velocity：音符がどの強さで演奏されるかを表す値で、音量の大きさを決定する。
+    例）{'type': 'NNN_time_signature_4/4', 'beat': 'Beat_2', 'chord': 'Chord_N_N', 'tempo': 'Tempo_121', 'instrument': 'Instrument_114', 'pitch': 'Note_Pitch_48', 'duration': 'Note_Duration_2', 'velocity': 'Note_Velocity_100'}
+    """
+    # Moonbeam表現：(onset, duration, octave, pitch_class, instrument, velocity) 
+    """
+    onset・durationの最小単位は10ms
+    onset：音の開始位置　4097トークン(M-model), 1024トークン(S-model)
+    duration：音の継続時間　4097トークン(M-model), 1024トークン(S-model)
+    octave：11トークン
+    pitch_class：12トークン(1オクターブの音階分)
+    instrument：129トークン(MIDI楽器全般)
+    velocity：128トークン
+    """
+    
+    # Convert to numpy for easier processing
+    if isinstance(amadeus_vocabs, torch.Tensor):
+        amadeus_np = amadeus_vocabs.cpu().numpy()
+        use_torch = True
+    elif isinstance(amadeus_vocabs, list):
+        amadeus_np = np.array(amadeus_vocabs)
+        use_torch = False
+    else:
+        amadeus_np = np.array(amadeus_vocabs)
+        use_torch = False
+    
+    # Check shape and transpose if needed
+    if amadeus_np.shape[0] == 8:
+        amadeus_np = amadeus_np.T  # [num_notes, 8]
+    
+    num_notes = amadeus_np.shape[1]
+    moonbeam_np = np.zeros((num_notes, 6), dtype=np.int32)
+    amadeus_np = amadeus_np[0]
+    
+    # State tracking
+    current_bar = -1
+    current_tempo = default_tempo
+    current_time_signature = (4, 4)  # (numerator, denominator)
+    
+    # First note
+    for k in range(6):
+        moonbeam_np[0, k] = 0
+    
+    for i in range(1, num_notes):
+        type_token = amadeus_np[i, 0]
+        beat_token = amadeus_np[i, 1]
+        chord_token = amadeus_np[i, 2]
+        tempo_token = amadeus_np[i, 3]
+        instrument_token = amadeus_np[i, 4]
+        pitch_token = amadeus_np[i, 5]
+        duration_token = amadeus_np[i, 6]
+        velocity_token = amadeus_np[i, 7]
+        
+        # Parse type token (NNN/SNN/SSN/SSS format)
+        if isinstance(type_token, str):
+            # Check for time signature change (NNN format)
+            if type_token.startswith('NNN_time_signature_'):
+                time_sig_match = re.search(r'time_signature_(\d+)/(\d+)', type_token)
+                if time_sig_match:
+                    current_time_signature = (int(time_sig_match.group(1)), int(time_sig_match.group(2)))
+                current_bar += 1
+            elif type_token == 'SNN':  # Same time sig, new bar, new beat
+                current_bar += 1
+            # SSN and SSS don't change bar
+        
+        # Extract tempo
+        if isinstance(tempo_token, str):
+            tempo_match = re.search(r'Tempo_(\d+)', tempo_token)
+            if tempo_match:
+                current_tempo = int(tempo_match.group(1))
+        else:
+            current_tempo = int(tempo_token) if tempo_token else default_tempo
+        
+        # Extract beat position within bar (0-15 for 4/4 time with in_beat_resolution=4)
+        if isinstance(beat_token, str):
+            beat_match = re.search(r'Beat_(\d+)', beat_token)
+            beat_index = int(beat_match.group(1)) if beat_match else 0
+        else:
+            beat_index = int(beat_token)
+        
+        # Calculate onset
+        # Beat index represents position in bar (0-15 for 4/4, in_beat_resolution=4)
+        numerator, denominator = current_time_signature
+        
+        # Total subdivisions per bar
+        subdivisions_per_bar = numerator * (4 / denominator) * in_beat_resolution
+        # For 4/4: 4 * 1 * 4 = 16 subdivisions per bar
+        
+        # Calculate onset in subdivisions (16th notes for in_beat_resolution=4)
+        onset_in_subdivisions = current_bar * subdivisions_per_bar + beat_index
+        
+        # Convert to quarter notes
+        onset_in_quarter_notes = onset_in_subdivisions / in_beat_resolution
+        
+        # Convert to milliseconds
+        ms_per_quarter_note = 60000.0 / current_tempo
+        onset_ms = onset_in_quarter_notes * ms_per_quarter_note
+        
+        # Convert to 10ms resolution
+        onset_in_10ms = int(round(onset_ms / time_resolution))
+        
+        # Extract duration (in subdivisions)
+        if isinstance(duration_token, str):
+            dur_match = re.search(r'Note_Duration_([\d.]+)', duration_token)
+            duration_in_subdivisions = float(dur_match.group(1)) if dur_match else 1.0
+        else:
+            duration_in_subdivisions = float(duration_token)
+        
+        # Convert duration to quarter notes
+        duration_in_quarter_notes = duration_in_subdivisions / in_beat_resolution
+        
+        # Convert to milliseconds
+        duration_ms = duration_in_quarter_notes * ms_per_quarter_note
+        duration_in_10ms = int(round(duration_ms / time_resolution))
+        duration_in_10ms = max(1, min(duration_in_10ms, 1024))
+        
+        # Extract pitch and convert to octave + pitch_class
+        if isinstance(pitch_token, str):
+            pitch_match = re.search(r'Note_Pitch_(\d+)', pitch_token)
+            pitch = int(pitch_match.group(1)) if pitch_match else 60
+        else:
+            pitch = int(pitch_token)
+        
+        octave = pitch // 12
+        pitch_class = pitch % 12
+        octave = max(0, min(octave, 10))
+        
+        # Extract instrument
+        if isinstance(instrument_token, str):
+            inst_match = re.search(r'Instrument_(\d+)', instrument_token)
+            instrument = int(inst_match.group(1)) if inst_match else 0
+        else:
+            instrument = int(instrument_token)
+        
+        instrument = max(0, min(instrument, 128))
+        
+        # Extract velocity
+        if isinstance(velocity_token, str):
+            vel_match = re.search(r'Note_Velocity_(\d+)', velocity_token)
+            velocity = int(vel_match.group(1)) if vel_match else 64
+        else:
+            velocity = int(velocity_token)
+        
+        velocity = max(0, min(velocity, 127))
+        
+        # Store in Moonbeam format
+        moonbeam_np[i, 0] = onset_in_10ms
+        moonbeam_np[i, 1] = duration_in_10ms
+        moonbeam_np[i, 2] = octave
+        moonbeam_np[i, 3] = pitch_class
+        moonbeam_np[i, 4] = instrument
+        moonbeam_np[i, 5] = velocity
+    
+    # Convert back to torch if input was torch
+    if use_torch:
+        moonbeam_tokens = torch.from_numpy(moonbeam_np).long()
+    else:
+        moonbeam_tokens = moonbeam_np
+    
+    return moonbeam_tokens
+
+def vocab_to_moonbeam2(amadeus_vocabs, time_resolution=10, default_tempo=120, in_beat_resolution=4):
+    # (Beat + 小節数) * Tempo → onset(ms)
+    # duration * Tempo → duration(ms)
+    # pitch → octave*12 + pitch_class
+    
+    # Amadeus表現：(type, beat, chord, tempo, instrument, pitch, duration, velocity)
+    """
+    Type：拍子の変化や継続の組み合わせの違いをそれぞれ表すもの。
+    Beat：同一小節内における音符の相対的な位置。
+    Chord：現在の音符が属している和音。
+    Tempo：音符の再生速度。一般に、テンポが高いほど楽曲は速くなる。
+    Instrument：現在の音符を演奏している楽器。
+    Pitch：音符の高さ。MIDI仕様に基づく128段階の離散値で表される。
+    Duration：音符が演奏される長さ（継続時間）。
+    Velocity：音符がどの強さで演奏されるかを表す値で、音量の大きさを決定する。
+    例）{'type': 'NNN_time_signature_4/4', 'beat': 'Beat_2', 'chord': 'Chord_N_N', 'tempo': 'Tempo_121', 'instrument': 'Instrument_114', 'pitch': 'Note_Pitch_48', 'duration': 'Note_Duration_2', 'velocity': 'Note_Velocity_100'}
+    """
+    # Moonbeam表現：(onset, duration, octave, pitch_class, instrument, velocity) 
+    """
+    onset・durationの最小単位は10ms
+    onset：音の開始位置　4097トークン(M-model), 1024トークン(S-model)
+    duration：音の継続時間　4097トークン(M-model), 1024トークン(S-model)
+    octave：11トークン
+    pitch_class：12トークン(1オクターブの音階分)
+    instrument：129トークン(MIDI楽器全般)
+    velocity：128トークン
+    """
+    
+    # Convert to numpy for easier processing
+    if isinstance(amadeus_vocabs, torch.Tensor):
+        amadeus_np = amadeus_vocabs.cpu().numpy()
+        use_torch = True
+    elif isinstance(amadeus_vocabs, list):
+        amadeus_np = np.array(amadeus_vocabs)
+        use_torch = False
+    else:
+        amadeus_np = np.array(amadeus_vocabs)
+        use_torch = False
+    
+    moonbeam_array = []
+    batch_size = amadeus_np.shape[0]
+    for b in range(batch_size):
+        num_notes = amadeus_np[b].shape[0]
+        moonbeam_np = np.zeros((num_notes*6), dtype=np.int32)
+    
+        # State tracking
+        current_bar = -1
+        current_tempo = default_tempo
+        current_time_signature = (4, 4)  # (numerator, denominator)
+        
+        # First note
+        for k in range(6):
+            moonbeam_np[k] = 0
+        
+        for i in range(1, num_notes):
+            type_token = amadeus_np[b, i, 0]
+            beat_token = amadeus_np[b, i, 1]
+            chord_token = amadeus_np[b, i, 2]
+            tempo_token = amadeus_np[b, i, 3]
+            instrument_token = amadeus_np[b, i, 4]
+            pitch_token = amadeus_np[b, i, 5]
+            duration_token = amadeus_np[b, i, 6]
+            velocity_token = amadeus_np[b, i, 7]
+            
+            # Parse type token (NNN/SNN/SSN/SSS format)
+            if isinstance(type_token, str):
+                # Check for time signature change (NNN format)
+                if type_token.startswith('NNN_time_signature_'):
+                    time_sig_match = re.search(r'time_signature_(\d+)/(\d+)', type_token)
+                    if time_sig_match:
+                        current_time_signature = (int(time_sig_match.group(1)), int(time_sig_match.group(2)))
+                    current_bar += 1
+                elif type_token == 'SNN':  # Same time sig, new bar, new beat
+                    current_bar += 1
+                # SSN and SSS don't change bar
+            
+            # Extract tempo
+            if isinstance(tempo_token, str):
+                tempo_match = re.search(r'Tempo_(\d+)', tempo_token)
+                if tempo_match:
+                    current_tempo = int(tempo_match.group(1))
+            else:
+                current_tempo = int(tempo_token) if tempo_token else default_tempo
+            
+            # Extract beat position within bar (0-15 for 4/4 time with in_beat_resolution=4)
+            if isinstance(beat_token, str):
+                beat_match = re.search(r'Beat_(\d+)', beat_token)
+                beat_index = int(beat_match.group(1)) if beat_match else 0
+            else:
+                beat_index = int(beat_token)
+            
+            # Calculate onset
+            # Beat index represents position in bar (0-15 for 4/4, in_beat_resolution=4)
+            numerator, denominator = current_time_signature
+            
+            # Total subdivisions per bar
+            subdivisions_per_bar = numerator * (4 / denominator) * in_beat_resolution
+            # For 4/4: 4 * 1 * 4 = 16 subdivisions per bar
+            
+            # Calculate onset in subdivisions (16th notes for in_beat_resolution=4)
+            onset_in_subdivisions = current_bar * subdivisions_per_bar + beat_index
+            
+            # Convert to quarter notes
+            onset_in_quarter_notes = onset_in_subdivisions / in_beat_resolution
+            
+            # Convert to milliseconds
+            ms_per_quarter_note = 60000.0 / current_tempo
+            onset_ms = onset_in_quarter_notes * ms_per_quarter_note
+            
+            # Convert to 10ms resolution
+            onset_in_10ms = int(round(onset_ms / time_resolution))
+            
+            # Extract duration (in subdivisions)
+            if isinstance(duration_token, str):
+                dur_match = re.search(r'Note_Duration_([\d.]+)', duration_token)
+                duration_in_subdivisions = float(dur_match.group(1)) if dur_match else 1.0
+            else:
+                duration_in_subdivisions = float(duration_token)
+            
+            # Convert duration to quarter notes
+            duration_in_quarter_notes = duration_in_subdivisions / in_beat_resolution
+            
+            # Convert to milliseconds
+            duration_ms = duration_in_quarter_notes * ms_per_quarter_note
+            duration_in_10ms = int(round(duration_ms / time_resolution))
+            duration_in_10ms = max(1, min(duration_in_10ms, 1024))
+            
+            # Extract pitch and convert to octave + pitch_class
+            if isinstance(pitch_token, str):
+                pitch_match = re.search(r'Note_Pitch_(\d+)', pitch_token)
+                pitch = int(pitch_match.group(1)) if pitch_match else 60
+            else:
+                pitch = int(pitch_token)
+            
+            octave = pitch // 12
+            pitch_class = pitch % 12
+            octave = max(0, min(octave, 10))
+            
+            # Extract instrument
+            if isinstance(instrument_token, str):
+                inst_match = re.search(r'Instrument_(\d+)', instrument_token)
+                instrument = int(inst_match.group(1)) if inst_match else 0
+            else:
+                instrument = int(instrument_token)
+            
+            instrument = max(0, min(instrument, 128))
+            
+            # Extract velocity
+            if isinstance(velocity_token, str):
+                vel_match = re.search(r'Note_Velocity_(\d+)', velocity_token)
+                velocity = int(vel_match.group(1)) if vel_match else 64
+            else:
+                velocity = int(velocity_token)
+            
+            velocity = max(0, min(velocity, 127))
+            
+            # Store in Moonbeam format
+            moonbeam_np[6*i+0] = onset_in_10ms
+            moonbeam_np[6*i+1] = duration_in_10ms
+            moonbeam_np[6*i+2] = octave
+            moonbeam_np[6*i+3] = pitch_class
+            moonbeam_np[6*i+4] = instrument
+            moonbeam_np[6*i+5] = velocity
+        
+        moonbeam_array.append(moonbeam_np)
+    
+    # Convert back to torch if input was torch
+    if use_torch:
+        moonbeam_tokens = torch.from_numpy(moonbeam_array).long()
+    else:
+        moonbeam_tokens = moonbeam_array
+    
+    return moonbeam_tokens
